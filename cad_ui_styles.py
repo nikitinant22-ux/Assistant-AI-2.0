@@ -119,3 +119,49 @@ def draw_round_rect_outline(canvas, w, h, r, outline_color, tag_name):
         smooth=True,
         tags=tag_name,
     )
+
+
+def draw_true_round_rect(canvas, x0, y0, x1, y1, r, fill=None, outline=None,
+                         width=1, tags=None):
+    """Рисует точный скруглённый прямоугольник через дуги и прямые линии.
+
+    В отличие от smooth-полигона (create_polygon), этот способ даёт честные
+    скругления заданного радиуса во всех четырёх углах и используется для
+    элементов Fluent-дизайна (выпадающий список агентов).
+
+    Аргументы:
+        canvas: объект tk.Canvas.
+        x0, y0: координаты левого верхнего угла.
+        x1, y1: координаты правого нижнего угла.
+        r: радиус скругления углов.
+        fill: цвет заливки.
+        outline: цвет контура (тонкая рамка).
+        width: толщина контура.
+        tags: тег для управления элементами.
+    """
+    # Заливка: четыре дуги по углам + центральный прямоугольник.
+    canvas.create_arc(x0, y0, x0 + 2 * r, y0 + 2 * r, start=90, extent=90,
+                      fill=fill, outline="", tags=tags)
+    canvas.create_arc(x1 - 2 * r, y0, x1, y0 + 2 * r, start=0, extent=90,
+                      fill=fill, outline="", tags=tags)
+    canvas.create_arc(x1 - 2 * r, y1 - 2 * r, x1, y1, start=270, extent=90,
+                      fill=fill, outline="", tags=tags)
+    canvas.create_arc(x0, y1 - 2 * r, x0 + 2 * r, y1, start=180, extent=90,
+                      fill=fill, outline="", tags=tags)
+    canvas.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline="", tags=tags)
+    canvas.create_rectangle(x0, y0 + r, x1, y1 - r, fill=fill, outline="", tags=tags)
+
+    # Тонкий контур отдельным проходом (если задан), чтобы не было стыков.
+    if outline:
+        canvas.create_arc(x0, y0, x0 + 2 * r, y0 + 2 * r, start=90, extent=90,
+                          fill="", outline=outline, width=width, tags=tags)
+        canvas.create_arc(x1 - 2 * r, y0, x1, y0 + 2 * r, start=0, extent=90,
+                          fill="", outline=outline, width=width, tags=tags)
+        canvas.create_arc(x1 - 2 * r, y1 - 2 * r, x1, y1, start=270, extent=90,
+                          fill="", outline=outline, width=width, tags=tags)
+        canvas.create_arc(x0, y1 - 2 * r, x0 + 2 * r, y1, start=180, extent=90,
+                          fill="", outline=outline, width=width, tags=tags)
+        canvas.create_line(x0 + r, y0, x1 - r, y0, fill=outline, width=width, tags=tags)
+        canvas.create_line(x0 + r, y1, x1 - r, y1, fill=outline, width=width, tags=tags)
+        canvas.create_line(x0, y0 + r, x0, y1 - r, fill=outline, width=width, tags=tags)
+        canvas.create_line(x1, y0 + r, x1, y1 - r, fill=outline, width=width, tags=tags)

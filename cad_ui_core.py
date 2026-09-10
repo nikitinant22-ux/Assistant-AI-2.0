@@ -12,6 +12,119 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "chat_history.json")
 
+
+class CanvasModernDropButton(tk.Canvas):
+    """Кастомная скруглённая кнопка выбора агента в стиле Windows 11.
+
+    Полностью отрисована на tkinter.Canvas: чистый холст без системных рамок
+    (highlightthickness=0, bd=0), скруглённый прямоугольник с плавными углами
+    (радиус 10px) через полигон со сглаживанием, белый текст агента и белая
+    галочка-уголок ˅ справа. Эффект Hover меняет цвет фона на более светлый
+    графит, клик вызывает переданную команду (показ меню выбора агентов).
+    """
+
+    def __init__(self, parent, text, command, **kwargs):
+        # Инициализируем чистый холст без системных рамок
+        super().__init__(parent, highlightthickness=0, bd=0, bg=parent["bg"],
+                         cursor="hand2", **kwargs)
+        self.text = text
+        self.command = command
+        self.base_color = "#2d2f34"
+        self.hover_color = "#3d4046"
+
+        # Размеры кнопки берутся из конфигурации Canvas
+        self.bind("<Configure>", self._draw)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", lambda e: self.command())
+
+    def _draw(self, event=None):
+        """Рисует скруглённый прямоугольник, белый текст и уголок-галочку."""
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        r = 10  # Радиус скругления углов по стандарту Windows 11
+
+        # Математическое рисование идеального скруглённого прямоугольника.
+        points = [r, 0, w - r, 0, w, 0, w, r, w, h - r, w, h,
+                  w - r, h, r, h, 0, h, 0, h - r, 0, r, 0, 0]
+        self.btn_shape = self.create_polygon(
+            points, fill=self.base_color, smooth=True, splinesteps=32)
+
+        # Выводим белый текст агента по центру со смещением влево.
+        self.create_text(15, h / 2, text=self.text, fill="white",
+                         font=("Segoe UI", 10), anchor="w")
+        # Рисуем изящный уголок-галочку ˅ справа.
+        self.create_text(w - 20, h / 2, text=" ˅ ", fill="white",
+                         font=("Segoe UI", 10, "bold"), anchor="center")
+
+    def _on_enter(self, event):
+        """При наведении меняет цвет фигуры на более светлый графит."""
+        self.itemconfig(self.btn_shape, fill=self.hover_color)
+
+    def _on_leave(self, event):
+        """При уходе мыши возвращает исходный цвет фигуры."""
+        self.itemconfig(self.btn_shape, fill=self.base_color)
+
+    def set_text(self, new_text):
+        """Обновляет текст выбранного агента и перерисовывает кнопку."""
+        self.text = new_text
+        self._draw()
+
+
+class RoundedButton:
+    """Кастомная скруглённая кнопка, отрисованная на tk.Canvas.
+
+    Обеспечивает аккуратное скругление углов (8px), недоступное в стандартном
+    tk.Button, без тяжёлой библиотеки customtkinter. Используется для кнопок
+    «Буфер», «Снимок» и «Ввод» в нижней панели ввода.
+    """
+
+    CORNER = 8              # радиус скругления углов (px)
+    HEIGHT = 36             # высота кнопки (px)
+
+    def __init__(self, master, text, command, bg, fg, width=86, side="left"):
+        """Создаёт скруглённую кнопку.
+
+        Аргументы:
+            master: родительский контейнер.
+            text: текст на кнопке.
+            command: вызываемая функция при клике.
+            bg: базовый цвет фона кнопки.
+            fg: цвет текста.
+            width: ширина кнопки (px).
+            side: сторона упаковки (left/right) внутри контейнера.
+        """
+        self.text = text
+        self.command = command
+        self.bg = bg
+        self.fg = fg
+        self.width = width
+
+        self.canvas = tk.Canvas(master, width=width, height=self.HEIGHT,
+                                bg=master["bg"], highlightthickness=0, bd=0)
+        self.canvas.pack(side=side, padx=4)
+        self.canvas.bind("<Button-1>", lambda e: self._click())
+        self._redraw()
+
+    def _click(self):
+        """Вызывает зарегистрированную команду при нажатии."""
+        if self.command:
+            self.command()
+
+    def _redraw(self):
+        """Рисует скруглённый прямоугольник с текстом по центру."""
+        c = self.canvas
+        w, h = self.width, self.HEIGHT
+        r = self.CORNER
+        c.delete("all")
+        pts = [r, 0, w - r, 0, w, 0, w, r, w, h - r, w, h,
+               w - r, h, r, h, 0, h, 0, h - r, 0, r, 0, 0]
+        c.create_polygon(pts, fill=self.bg, smooth=True)
+        c.create_text(w / 2, h / 2, text=self.text, fill=self.fg,
+                      font=("Segoe UI Semibold", 10))
+
+
 class CadAiAssistantUI:
     def __init__(self, root, on_submit_callback=None, on_vision_callback=None):
         self.root = root
@@ -40,6 +153,8 @@ class CadAiAssistantUI:
         
         self.setup_ui()
         self.restore_chat_view()
+        # Синхронизируем показ приветствия с наличием истории чата.
+        self._sync_welcome()
         
         # Запускаем первый стартовый цикл проверки связи с AutoCAD
         self.update_active_drawing_status()
@@ -80,6 +195,38 @@ class CadAiAssistantUI:
         self.input_entry.delete(0, tk.END)
         self.input_entry.focus_set()
         self.log("[Система]: ... Контекст памяти ИИ полностью сброшен. Директивы очищены.", "system")
+        # После очистки окно чата снова показывает приветственный блок.
+        self.show_welcome()
+
+    def _submit(self):
+        """Отправляет запрос: сначала скрывает приветствие, затем вызывает колбэк.
+
+        Приветственный блок мгновенно исчезает, уступая место обычному логу
+        сообщений чата и секундомеру, как только пользователь нажимает «Ввод».
+        """
+        self.hide_welcome()
+        if self.on_submit:
+            self.on_submit(self)
+
+    def show_welcome(self):
+        """Показывает отцентрированный приветственный блок поверх пустого чата."""
+        if getattr(self, "welcome_frame", None) is not None:
+            self.welcome_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+    def hide_welcome(self):
+        """Скрывает приветственный блок, освобождая место для лога чата."""
+        if getattr(self, "welcome_frame", None) is not None:
+            self.welcome_frame.place_forget()
+
+    def _sync_welcome(self):
+        """Синхронизирует показ приветствия с наличием истории чата.
+
+        Если история пуста — блок показывается, иначе (есть сообщения) — скрыт.
+        """
+        if self.history:
+            self.hide_welcome()
+        else:
+            self.show_welcome()
 
     def load_settings(self):
         if os.path.exists(SETTINGS_FILE):
@@ -125,11 +272,62 @@ class CadAiAssistantUI:
     def open_settings_window(self):
         cad_system.open_settings_window(self)
 
+    def show_agent_menu(self):
+        """Показывает стилизованное под тёмную тему меню выбора агентов.
+
+        Клик по Canvas-кнопке вызывает это стандартное tk.Menu, оформленное в
+        той же графитовой палитре, что и сама кнопка. При выборе агента текст
+        на кнопке обновляется через set_text(), а agent_var фиксирует выбор.
+        """
+        # Стандартное меню, оформленное под тёмную тему (без белых уголков).
+        menu = tk.Menu(self.root, tearoff=0,
+                       bg="#2d2f34", fg="#FFFFFF",
+                       activebackground="#3d4046", activeforeground="#FFFFFF",
+                       bd=1, relief="solid", font=("Segoe UI", 10))
+        for name in ("Ассистент-Чертёжник", "Ассистент-Аналитик",
+                     "Ассистент-Оператор", "Ассистент-Справочник"):
+            menu.add_radiobutton(
+                label=name, value=name, variable=self.agent_var,
+                command=lambda n=name: self._select_agent(n))
+        # Показываем меню у левого нижнего края кнопки.
+        x = self.agent_button.winfo_rootx()
+        y = self.agent_button.winfo_rooty() + self.agent_button.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _select_agent(self, name):
+        """Обновляет текст выбранного агента на Canvas-кнопке."""
+        self.agent_button.set_text(name)
+
     def paste_from_clipboard(self):
         try:
             text = self.root.clipboard_get()
             if text: self.input_entry.insert(self.input_entry.index(tk.INSERT), text)
         except tk.TclError: pass
+
+    def _redraw_entry(self):
+        """Перерисовывает скруглённую подложку поля ввода (заливка + рамка).
+
+        Заливка всегда отрисовывается в глубоком графите dark_box, а тонкая
+        тёмно-серая рамка появляется только когда поле находится в фокусе.
+        """
+        w = self.entry_canvas.winfo_width()
+        h = self.entry_canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        cad_ui_styles.draw_round_rect(self.entry_canvas, w, h, 10, self.dark_box, "round_entry")
+        if self._entry_focused:
+            cad_ui_styles.draw_round_rect_outline(
+                self.entry_canvas, w, h, 10, "#5A6270", "round_entry_outline")
+        else:
+            self.entry_canvas.delete("round_entry_outline")
+
+    def _set_entry_focus(self, active):
+        """Включает/выключает рамку фокуса у поля ввода и перерисовывает его."""
+        self._entry_focused = active
+        self._redraw_entry()
 
     def log(self, text, tag="ai"):
         """Печатает текст в чат и гарантированно возвращает точный номер строки, на которой он напечатан"""
@@ -182,35 +380,18 @@ class CadAiAssistantUI:
         tk.Button(top_frame, text="🗑 Очистить", bg=self.bg_color, fg="#EF5350", font=("Segoe UI Semibold", 9), bd=0, activebackground=self.bg_color, activeforeground="#FF8A80", command=self.clear_chat_context).pack(side="right", padx=(10, 0))
         
         # Список доступных агентов (лаконичные названия для конечного пользователя).
-        # Выбор агента: стандартный tk.OptionMenu вместо ttk.Combobox.
-        # Жёсткие контрастные параметры под тёмную тему. Список размещается
-        # в левом верхнем углу окна, сразу под строкой статуса подключения.
+        # Кнопка выбора агента — чистый Canvas (Fluent), клик открывает тёмное
+        # меню, поскольку стандартный tk.OptionMenu не умеет скруглять углы.
         agent_row = tk.Frame(self.root, bg=self.bg_color)
         agent_row.pack(fill="x", padx=20, pady=(0, 10))
 
         self.agent_var = tk.StringVar(value="Ассистент-Чертёжник")
-        self.agent_menu = tk.OptionMenu(
-            agent_row,
-            self.agent_var,
-            "Ассистент-Чертёжник",
-            "Ассистент-Аналитик",
-            "Ассистент-Оператор",
-            "Ассистент-Справочник",
+        # Кнопка выбора агента — чистый Canvas без системных рамок (Fluent).
+        self.agent_button = CanvasModernDropButton(
+            agent_row, text="Ассистент-Чертёжник",
+            command=self.show_agent_menu, width=220, height=36,
         )
-        # Контрастные параметры виджета, гарантирующие видимость на тёмном фоне.
-        self.agent_menu.config(
-            bg="#2d2f34", fg="white",
-            activebackground="#40444b", activeforeground="white",
-            relief="flat", bd=1, highlightthickness=0,
-            font=("Segoe UI", 9), padx=12, pady=4,
-        )
-        # Оформляем само раскрывающееся меню в той же тёмной палитре.
-        self.agent_menu["menu"].config(
-            bg="#2d2f34", fg="white",
-            activebackground="#40444b", activeforeground="white",
-            bd=0, font=("Segoe UI", 9),
-        )
-        self.agent_menu.pack(side="left")
+        self.agent_button.pack(side="left")
 
         chat_container = tk.Frame(self.root, bg=self.bg_color, bd=0, highlightthickness=0)
         chat_container.pack(fill="both", expand=True, padx=20, pady=10)
@@ -228,6 +409,34 @@ class CadAiAssistantUI:
         self.chat_area.tag_configure("timer", foreground="#00BCD4", font=("Consolas Italic", 10))
         self.chat_area.tag_configure("error_raw", foreground="#FF8A80", font=("Consolas", 9))
 
+        # Приветственный блок (Welcome Screen) для пустого окна чата.
+        # Отображается по центру текстовой области и помогает пользователю
+        # сориентироваться при старте программы или после очистки истории.
+        self.welcome_frame = tk.Frame(chat_container, bg=self.dark_box)
+        welcome_title = tk.Label(
+            self.welcome_frame, text="Привет! Я твой ИИ-Ассистент AutoCAD",
+            bg=self.dark_box, fg="#E6E6EA", font=("Segoe UI Semibold", 14),
+            justify="center",
+        )
+        welcome_title.pack(pady=(0, 10))
+        welcome_sub = tk.Label(
+            self.welcome_frame,
+            text="Выбери нужного агента вверху и задай задачу. Например:",
+            bg=self.dark_box, fg="#9AA0AA", font=("Segoe UI", 10),
+            justify="center",
+        )
+        welcome_sub.pack(pady=(0, 14))
+        # Примеры запросов для разных агентов (мелкий аккуратный шрифт).
+        examples = (
+            "• «Начерти круг радиусом 50 в точке 0,0» — для Чертёжника",
+            "• «Покажи точки пересечения этих прямых» — для Аналитика",
+            "• «Поменяй цвет слою на зеленый» — для Оператора",
+        )
+        for line in examples:
+            tk.Label(self.welcome_frame, text=line, bg=self.dark_box,
+                     fg="#7C828D", font=("Segoe UI", 9), justify="left"
+                     ).pack(anchor="w", pady=2)
+
         bottom_frame = tk.Frame(self.root, bg=self.bg_color)
         bottom_frame.pack(fill="x", padx=20, pady=(0, 20))
         
@@ -237,20 +446,27 @@ class CadAiAssistantUI:
         
         self.entry_canvas = tk.Canvas(entry_wrapper, bg=self.bg_color, bd=0, highlightthickness=0)
         self.entry_canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self.entry_canvas.bind("<Configure>", lambda e: cad_ui_styles.draw_round_rect(self.entry_canvas, e.width, e.height, 12, self.dark_box, "round_entry"))
-        
+        self._entry_focused = False
+        self.entry_canvas.bind("<Configure>", lambda e: self._redraw_entry())
+
         self.input_entry = tk.Entry(entry_wrapper, bg=self.dark_box, fg=self.text_color, insertbackground=self.text_color, bd=0, highlightthickness=0, font=("Segoe UI", 10))
         self.input_entry.pack(fill="x", padx=12, pady=9)
+        # Лёгкая тёмно-серая рамка поля ввода, сигнализирующая о фокусе.
+        self.input_entry.bind("<FocusIn>", lambda e: self._set_entry_focus(True))
+        self.input_entry.bind("<FocusOut>", lambda e: self._set_entry_focus(False))
         
-        tk.Button(bottom_frame, text="Буфер", bg="#3E3E4A", fg=self.text_color, font=("Segoe UI Semibold", 9), bd=0, command=self.paste_from_clipboard).pack(side="left", padx=(8, 2), ipady=5)
+        # Кнопки нижней панели ввода на кастомном Canvas со скруглением 8px.
+        # «Ввод» — приглушённый благородный неоново-синий (#1a73e8), а не
+        # ядовито-синий, чтобы не выбиваться из дорогой тёмной темы.
+        RoundedButton(bottom_frame, "Буфер", self.paste_from_clipboard,
+                      bg="#3E3E4A", fg=self.text_color, width=80)
+        RoundedButton(bottom_frame, "👁 Снимок",
+                      lambda: self.on_vision(self) if self.on_vision else None,
+                      bg="#3E3E4A", fg=self.text_color, width=90)
+        RoundedButton(bottom_frame, "Ввод", self._submit,
+                      bg="#1a73e8", fg=self.text_color, width=120, side="right")
         
-        tk.Button(bottom_frame, text="👁 Снимок", bg="#3E3E4A", fg=self.text_color, font=("Segoe UI Semibold", 9), bd=0, 
-                  command=lambda: self.on_vision(self) if self.on_vision else None).pack(side="left", padx=2, ipady=5)
-        
-        tk.Button(bottom_frame, text="Ввод", bg="#2196F3", fg=self.text_color, font=("Segoe UI Semibold", 9), bd=0, width=12, 
-                  command=lambda: self.on_submit(self) if self.on_submit else None).pack(side="right", padx=(2, 0), ipady=5)
-        
-        self.input_entry.bind("<Return>", lambda event: self.on_submit(self) if self.on_submit else None)
+        self.input_entry.bind("<Return>", lambda event: self._submit())
 
 
 def _launch_application():
