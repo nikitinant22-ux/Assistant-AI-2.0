@@ -1,0 +1,67 @@
+name: Auto Version and README Update
+
+on:
+  push:
+    branches:
+      - main # Скрипт срабатывает, когда изменения попадают в ветку main
+    paths-ignore: # Игнорируем изменения, сделанные самим ботом, чтобы избежать бесконечного цикла
+      - 'pyproject.toml'
+      - 'README.md'
+
+jobs:
+  bump-and-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Скачиваем код репозитория
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.SOURCECRAFT_TOKEN }} # Используем ваш токен для полного доступа
+
+    # 2. Настраиваем Python окружение
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # 3. Скрипт автоматизации версий и README
+    - name: Run automation script
+      run: |
+        python -c "
+        import re
+        from datetime import datetime
+
+        # 1. Авто-обновление версии в pyproject.toml (повышаем патч-версию, например 1.0.0 -> 1.0.1)
+        with open('pyproject.toml', 'r') as f:
+            content = f.read()
+        
+        version_match = re.search(r'version = \"(\d+)\.(\d+)\.(\d+)\"', content)
+        if version_match:
+            major, minor, patch = map(int, version_match.groups())
+            new_patch = patch + 1
+            new_version = f'{major}.{minor}.{new_patch}'
+            content = re.sub(r'version = \"\d+\.\d+\.\d+\"', f'version = \"{new_version}\"', content)
+            with open('pyproject.toml', 'w') as f:
+                f.write(content)
+            print(f'New version calculated: {new_version}')
+        else:
+            new_version = '1.0.0'
+
+        # 2. Авто-обновление README.md
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_entry = f'\n- **Последнее изменение:** Версия {new_version} успешно обновлена пайплайном в {current_time} UTC.\n'
+        
+        with open('README.md', 'a') as f:
+            f.write(log_entry)
+        "
+
+    # 4. Сохраняем изменения и отправляем обратно на GitHub / SourceCraft
+    - name: Commit and Push changes
+      run: |
+        git config --global user.name "SourceCraft Automation"
+        git config --global user.email "automation@sourcecraft.dev"
+        
+        git add pyproject.toml README.md
+        git commit -m "chore: auto-bump version and update README [skip ci]"
+        git push origin main
