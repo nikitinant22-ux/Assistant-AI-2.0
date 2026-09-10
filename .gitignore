@@ -1,0 +1,27 @@
+# Папки сборщика PyInstaller (весят сотни мегабайт, на Git не нужны)
+/build/
+/dist/
+*.spec
+
+# Временный кэш компиляции Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+compile_project.bat
+
+# Локальные файлы настроек и истории конкретного пользователя
+chat_history.json
+settings.json
+
+# Среда разработки VS Code
+.vscode/
+
+# Системные файлы Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+autolisp-rules.md
+Plan.docx
