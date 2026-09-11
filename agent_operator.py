@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
-"""agent_operator.py — ИИ-агент «Оператор» (Предприниматель) для управления средой.
+"""agent_operator.py — ИИ-агент «Оператор» (pyautocad, Блок 5 спецификации).
 
 Данный модуль отвечает за изменение рабочей среды AutoCAD:
-    1. Навигация: переключение на Пространство Модели, на конкретный Лист
-       (Layout) или на другую открытую вкладку чертежа.
+    1. Навигация: переключение на Пространство Модели (ActiveSpace = 1), на
+       конкретный Лист (ActiveLayout) или на другую открытую вкладку чертежа.
     2. Управление свойствами объектов и слоёв: изменение цвета объекта по его
-       Handle и цвета слоя по его имени, с поддержкой текстовых названий цветов
-       на русском языке.
-    3. Прочие операторские действия (зум, создание слоёв, модификация объектов)
-       — сохранены для обратной совместимости с диспетчером JSON-паспортов.
+       Handle (obj.Color = index) и перенос объекта на другой слой
+       (obj.Layer = name), с поддержкой текстовых названий цветов.
+
+Работа выполняется СТРОГО через стабильную оболочку pyautocad:
+    - acad.doc -> ActiveSpace, ActiveLayout, Layouts, HandleToObject;
+    - acad.app -> Documents (активация других вкладок).
 
 Ключевые принципы:
     - Функции принимают только базовые типы (int, float, list, str) и возвращают
       JSON-совместимый словарь ({"status": "success"/"error", ...}).
-    - Внутри модуля НЕ используется exec()/eval() — только статичные функции.
-    - Для работы с COM используются объекты связи из core_core, включая
-      update_screen() для мгновенного обновления чертежа.
+    - Внутри модуля НЕ используется exec()/eval() и НЕ используется сырой
+      win32com.client — только статичные функции pyautocad.
+    - Для обновления экрана используется update_screen() (acad.doc.Regen(1)).
     - Цвета: для текстовых названий используется справочник имён -> ACI.
 
 Все комментарии и строки документации написаны на русском языке.
@@ -26,8 +28,7 @@ from __future__ import annotations
 import math  # тригонометрические функции для поворота объектов
 
 import cad_colors_data  # справочник соответствия ACI-цветов значениям RGB
-from core_core import (get_autocad_connection, acad_app, doc, model_space,
-                       object_center, to_cad_point, update_screen)
+from core_core import ensure_connection, get_acad, object_center, to_cad_point, update_screen
 
 
 # ========================================================================
@@ -115,42 +116,39 @@ def _ok(message, **extra):
 def _ensure_connection():
     """Гарантирует актуальное подключение к AutoCAD и возвращает объекты связи.
 
-    Вызывает get_autocad_connection() из core_core, который заполняет глобальные
-    переменные acad_app, doc и model_space.
+    Сначала проверяет «пульс» COM-сессии через core_core.ensure_connection()
+    (с автоматическим восстановлением моста pyautocad при обрыве сессии
+    -2147220995 'Объект не подключен к серверу'). При неудаче возвращает кортеж
+    из None. Вызывается в начале каждой операторской функции.
 
     Возвращает:
-        tuple (acad_app, doc, model_space) — объекты COM-связи AutoCAD.
+        tuple (app, doc, model) — объекты связи AutoCAD либо (None, None, None).
     """
-    global acad_app, doc, model_space
-    try:
-        app, current_doc, ms = get_autocad_connection()
-        acad_app = app
-        doc = current_doc
-        model_space = ms
-    except Exception:
-        pass
-    return acad_app, doc, model_space
+    if not ensure_connection():
+        return None, None, None
+    acad = get_acad()
+    return acad.app, acad.doc, acad.model
 
 
 # ========================================================================
-# ОПЕРАТОРСКИЕ ИНСТРУМЕНТЫ НАВИГАЦИИ (JSON-ИНТЕРФЕЙС)
+# ОПЕРАТОРСКИЕ ИНСТРУМЕНТЫ НАВИГАЦИИ (JSON-ИНТЕРФЕЙС) — БЛОК 5 СПЕЦИФИКАЦИИ
 # ========================================================================
 
 def switch_to_model():
     """Переключает текущее графическое окно AutoCAD на Пространство Модели.
 
-    Устанавливает активный лист на «Model» через коллекцию Layouts документа.
-    После переключения экран принудительно обновляется.
+    Устанавливает acad.doc.ActiveSpace = 1 (переход в Модель) согласно Блоку 5
+    спецификации. После переключения экран принудительно обновляется.
 
     Возвращает:
         dict — {"status": "success", "message": "..."} либо ошибку.
     """
-    app, current_doc, _ = _ensure_connection()
+    _, current_doc, _ = _ensure_connection()
     if current_doc is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
-        # Устанавливаем активный лист на пространство модели («Model»).
-        current_doc.ActiveLayout = current_doc.Layouts.Item("Model")
+        # ActiveSpace = 1 — переключаемся в Пространство Модели.
+        current_doc.ActiveSpace = 1
         update_screen()
         return _ok("Переключено на Пространство Модели.")
     except Exception as e:
@@ -160,8 +158,8 @@ def switch_to_model():
 def switch_to_sheet(sheet_name: str):
     """Переключает экран на конкретный Лист (Layout) по его имени.
 
-    Предварительно проверяет, существует ли такой лист в коллекции doc.Layouts
-    (регистр символов не важен). После переключения экран обновляется.
+    Изменяет acad.doc.ActiveLayout через коллекцию Layouts (Блок 5 спецификации).
+    Предварительно проверяет, существует ли такой лист (регистр не важен).
 
     Аргументы:
         sheet_name: имя листа/вкладки для переключения.
@@ -169,29 +167,35 @@ def switch_to_sheet(sheet_name: str):
     Возвращает:
         dict — {"status": "success", "message": "..."} либо ошибку.
     """
-    app, current_doc, _ = _ensure_connection()
+    _, current_doc, _ = _ensure_connection()
     if current_doc is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     if not sheet_name or not str(sheet_name).strip():
         return _err("Не задано имя листа для переключения.")
-    target = str(sheet_name).strip().lower()
+    target = str(sheet_name).strip()
     try:
-        # Ищем лист в коллекции Layouts (без учёта регистра).
-        for layout in current_doc.Layouts:
-            if str(layout.Name).strip().lower() == target:
-                current_doc.ActiveLayout = layout
-                update_screen()
-                return _ok(f"Переключено на лист '{layout.Name}'.")
+        # Активируем лист через коллекцию Layouts (по точному имени).
+        current_doc.ActiveLayout = current_doc.Layouts.Item(target)
+        update_screen()
+        return _ok(f"Переключено на лист '{target}'.")
+    except Exception:
+        # Резервный вариант: поиск листа без учёта регистра.
+        try:
+            for layout in current_doc.Layouts:
+                if str(layout.Name).strip().lower() == target.lower():
+                    current_doc.ActiveLayout = layout
+                    update_screen()
+                    return _ok(f"Переключено на лист '{layout.Name}'.")
+        except Exception as e:
+            return _err(f"Ошибка переключения на лист: {e}")
         return _err(f"Лист '{sheet_name}' не существует на этом чертеже")
-    except Exception as e:
-        return _err(f"Ошибка переключения на лист: {e}")
 
 
 def switch_to_drawing(drawing_name: str):
     """Активирует другую открытую вкладку чертежа по её имени.
 
-    Переносит фокус приложения на документ с указанным именем (например,
-    «чертеж2.dwg») через коллекцию acad_app.Documents.
+    Переносит фокус приложения на документ с указанным именем через коллекцию
+    acad.app.Documents (Блок 5 спецификации: Documents.Item(...).Activate()).
 
     Аргументы:
         drawing_name: имя открытого чертежа для активации.
@@ -207,12 +211,11 @@ def switch_to_drawing(drawing_name: str):
     target = str(drawing_name).strip().lower()
     try:
         docs = app.Documents
-        for i in range(docs.Count):
-            candidate = docs.Item(i)
+        for candidate in docs:
             candidate_name = str(candidate.Name).strip().lower()
             # Сравниваем по полному имени и по базовому имени (без расширения).
             if candidate_name == target or candidate_name.startswith(target):
-                app.ActiveDocument = candidate
+                candidate.Activate()
                 update_screen()
                 return _ok(f"Активирован чертёж '{candidate.Name}'.")
         return _err(f"Чертёж '{drawing_name}' не найден среди открытых вкладок")
@@ -221,16 +224,16 @@ def switch_to_drawing(drawing_name: str):
 
 
 # ========================================================================
-# ОПЕРАТОРСКИЕ ИНСТРУМЕНТЫ УПРАВЛЕНИЯ ЦВЕТОМ (JSON-ИНТЕРФЕЙС)
+# ОПЕРАТОРСКИЕ ИНСТРУМЕНТЫ УПРАВЛЕНИЯ СВОЙСТВАМИ (JSON-ИНТЕРФЕЙС)
 # ========================================================================
 
 def change_object_color(object_handle: str, color_input):
     """Изменяет цвет объекта в чертеже по его Handle.
 
-    Находит объект через doc.HandleToObject(). Если color_input — строка
-    (например, «красный», «синий»), она автоматически преобразуется в индекс
-    ACI через словарь COLOR_NAME_TO_ACI. Если color_input — число, присваивается
-    индекс напрямую. После изменения экран обновляется.
+    Находит объект через acad.doc.HandleToObject() и присваивает obj.Color = index
+    (Блок 5 спецификации). Если color_input — строка (например, «красный»), она
+    автоматически преобразуется в индекс ACI через словарь COLOR_NAME_TO_ACI.
+    После изменения экран обновляется.
 
     Аргументы:
         object_handle: строковый Handle существующего объекта в чертеже.
@@ -262,10 +265,44 @@ def change_object_color(object_handle: str, color_input):
         return _err(f"Ошибка изменения цвета объекта: {e}")
 
 
+def move_object_to_layer(object_handle: str, layer_name: str):
+    """Переносит объект на указанный слой (Блок 5: obj.Layer = name).
+
+    Находит объект через acad.doc.HandleToObject() и присваивает его свойству
+    obj.Layer строковое имя слоя. После изменения экран обновляется.
+
+    Аргументы:
+        object_handle: строковый Handle существующего объекта в чертеже.
+        layer_name: имя целевого слоя, на который переносится объект.
+
+    Возвращает:
+        dict — {"status": "success", "message": "..."} либо ошибку.
+    """
+    _, current_doc, _ = _ensure_connection()
+    if current_doc is None:
+        return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+    if not object_handle or not str(object_handle).strip():
+        return _err("Не задан Handle объекта для переноса на слой.")
+    if not layer_name or not str(layer_name).strip():
+        return _err("Не задано имя слоя для переноса объекта.")
+    try:
+        # Находим объект в базе чертежа по его уникальному дескриптору.
+        try:
+            target_obj = current_doc.HandleToObject(str(object_handle))
+        except Exception:
+            return _err(f"Объект с Handle '{object_handle}' не найден в чертеже.")
+        target_obj.Layer = str(layer_name)
+        target_obj.Update()
+        update_screen()
+        return _ok(f"Объект '{object_handle}' перенесён на слой '{layer_name}'.")
+    except Exception as e:
+        return _err(f"Ошибка переноса объекта на слой: {e}")
+
+
 def change_layer_color(layer_name: str, color_input):
     """Изменяет цвет всего слоя по его имени.
 
-    Находит слой в коллекции doc.Layers. Если color_input — строка, она
+    Находит слой в коллекции acad.doc.Layers. Если color_input — строка, она
     преобразуется в индекс ACI через словарь COLOR_NAME_TO_ACI; если число —
     присваивается напрямую. После изменения экран обновляется.
 
@@ -425,7 +462,7 @@ def modify_object(acad, target_obj, action, params, unsupported_prefix="[НЕ П
     """Изменяет свойства/геометрию выделенного объекта.
 
     Действия (action): move, rotate, scale, set_layer, set_color, hide, show,
-    delete. Координаты перемещения упаковываются в COM-массив через to_cad_point.
+    delete. Координаты перемещения упаковываются в APoint через to_cad_point.
 
     Аргументы:
         acad: объект-коннектор AutoCAD (с атрибутом doc).
@@ -490,16 +527,21 @@ def modify_object(acad, target_obj, action, params, unsupported_prefix="[НЕ П
         return f"Ошибка изменения объекта: {str(e)}"
 
 
-def select_by_type(acad, model_space, obj_type=None, layer=None, win32com_client=None, pythoncom_mod=None):
+def select_by_type(acad, model_space, obj_type=None, layer=None,
+                   win32com_client=None, pythoncom_mod=None):
     """Выделяет в AutoCAD объекты, отфильтрованные по типу и/или слою.
+
+    Работает полностью через pyautocad (без сырого win32com.client): найденные
+    объекты передаются в коллекцию SelectionSets методом AddItems, который при
+    динамическом COM-вызове принимает обычный список объектов.
 
     Аргументы:
         acad: объект-коннектор AutoCAD (с атрибутом doc).
         model_space: коллекция ModelSpace текущего чертежа.
         obj_type: тип примитива для фильтрации.
         layer: имя слоя для фильтрации.
-        win32com_client: модуль win32com.client (ленивый импорт при необходимости).
-        pythoncom_mod: модуль pythoncom (ленивый импорт при необходимости).
+        win32com_client: игнорируется (оставлено для обратной совместимости).
+        pythoncom_mod: игнорируется (оставлено для обратной совместимости).
 
     Возвращает:
         str — количество выделенных объектов либо сообщение об ошибке.
@@ -516,14 +558,9 @@ def select_by_type(acad, model_space, obj_type=None, layer=None, win32com_client
                     ssets.Item(i).Delete()
             except Exception:
                 pass
-        # Ленивый импорт COM-модулей для упаковки набора в VARIANT.
-        if win32com_client is None:
-            import win32com.client as win32com_client
-        if pythoncom_mod is None:
-            import pythoncom as pythoncom_mod
         ss = ssets.Add("AI_SELECT")
-        data = win32com_client.VARIANT(pythoncom_mod.VT_ARRAY | pythoncom_mod.VT_DISPATCH, found)
-        ss.AddItems(data)
+        # Передаём список объектов напрямую (comtypes dynamic сам упакует в SAFEARRAY).
+        ss.AddItems(found)
         acad.doc.Regen(1)
         return f"Выделено и подсвечено объектов: {len(found)}."
     except Exception as e:
@@ -633,58 +670,43 @@ def execute_json_command(json_str_or_dict, acad, acad_app, active_doc, model_spa
     # ---- 3. МАРШРУТИЗАЦИЯ ПО ФУНКЦИЯМ АГЕНТОВ ----
     try:
         if command == "zoom_all":
-            # Показать весь чертёж целиком (без параметров).
             return zoom_all(acad_app)
-
         elif command == "create_layer":
-            # Создание слоя с ACI-цветом: обязательны name и color_aci.
             try:
                 name = params["name"]
                 color_aci = params["color_aci"]
             except KeyError as e:
                 return f"Ошибка: Отсутствует обязательный параметр {e} для команды 'create_layer'. Требуются 'name' и 'color_aci'."
             return create_layer_aci(acad, name, color_aci)
-
         elif command == "switch_layout":
-            # Переключение листа: обязателен name.
             try:
                 name = params["name"]
             except KeyError as e:
                 return f"Ошибка: Отсутствует обязательный параметр {e} для команды 'switch_layout'. Требуется 'name'."
             return switch_to_layout(active_doc, name)
-
         elif command == "switch_to_model":
-            # Переключение на пространство модели (JSON-интерфейс оператора).
             return switch_to_model()
-
         elif command == "switch_to_sheet":
-            # Переключение на конкретный лист по имени.
             name = params.get("name") or params.get("sheet") or ""
             return switch_to_sheet(name)
-
         elif command == "switch_to_drawing":
-            # Активация другой открытой вкладки чертежа.
             name = params.get("name") or params.get("drawing") or ""
             return switch_to_drawing(name)
-
         elif command == "change_object_color":
-            # Изменение цвета объекта по его Handle.
             handle = params.get("handle") or ""
             color = params.get("color") or params.get("color_aci") or 7
             return change_object_color(handle, color)
-
+        elif command == "move_object_to_layer":
+            handle = params.get("handle") or ""
+            layer = params.get("layer") or params.get("name") or ""
+            return move_object_to_layer(handle, layer)
         elif command == "change_layer_color":
-            # Изменение цвета слоя по его имени.
             layer = params.get("layer") or params.get("name") or ""
             color = params.get("color") or params.get("color_aci") or 7
             return change_layer_color(layer, color)
-
         elif command == "zoom_to_object":
-            # Фокус на выделенном объекте (без параметров, объект уже известен).
             return zoom_to_object(acad, target_obj)
-
         elif command in ("get_property", "read_data"):
-            # ИНФОРМАЦИОННЫЙ ЗАПРОС: чтение данных/свойств документа через COM.
             try:
                 property_name = params.get("property") or params.get("name") or ""
             except KeyError:
@@ -693,68 +715,45 @@ def execute_json_command(json_str_or_dict, acad, acad_app, active_doc, model_spa
                 return ("Ошибка: Для команды 'get_property' обязателен параметр 'property'. "
                         "Доступно: document_name, document_path, object_count, object_types, layout_name.")
             return read_document_property(active_doc, property_name)
-
         elif command in ("inspect_object", "inspect", "информация об объекте", "свойства объекта"):
-            # Чтение свойств выделенного объекта (тип, слой, цвет, геометрия).
             return inspect_object(target_obj, unsupported_prefix)
-
         elif command in ("modify_object", "modify", "изменить объект", "edit_object", "редактировать объект"):
-            # Изменение выделенного объекта. action: move/rotate/scale/set_layer/set_color/hide/show/delete.
             action = params.get("action") or params.get("operation") or params.get("операция") or ""
             return modify_object(acad, target_obj, action, params, unsupported_prefix)
-
         elif command in ("find_objects", "search_objects", "найти объекты", "поиск объектов"):
-            # Поиск объектов по типу примитива и/или слою.
             return find_objects(
                 model_space,
                 params.get("obj_type") or params.get("type") or params.get("тип"),
                 params.get("layer") or params.get("слой"),
             )
-
         elif command in ("select_by_type", "select_objects", "выделить объекты", "выделить по типу"):
-            # Выделение объектов в AutoCAD по типу и/или слою.
             return select_by_type(
                 acad, model_space,
                 params.get("obj_type") or params.get("type") or params.get("тип"),
                 params.get("layer") or params.get("слой"),
             )
-
         elif command in ("count_by_layer", "count_layer", "подсчет по слоям", "количество по слоям"):
-            # Количество объектов на каждом слое.
             return count_by_layer(model_space)
-
         elif command in ("list_layers", "layers", "список слоёв", "список слоев", "какие слои"):
-            # Список всех слоёв чертежа.
             return list_layers(active_doc)
-
         elif command in ("list_layouts", "layouts", "список листов", "список вкладок", "какие листы"):
-            # Список всех листов/вкладок чертежа.
             return list_layouts(active_doc)
-
         elif command in ("undo", "undo_last", "отменить", "отмена"):
-            # Отмена последнего действия в чертеже.
             return undo_last(acad)
-
         elif command in ("list_open_documents", "open_documents", "список чертежей",
                          "открытые чертежи", "какие чертежи открыты", "все открытые чертежи"):
-            # Перечисление всех открытых чертежей в AutoCAD.
             return list_open_documents(acad_app)
-
         elif command in ("unsupported", "unavailable", "cannot", "noop", "not_supported"):
-            # ЧЕСТНЫЙ ОТКАЗ: запрос выходит за пределы доступных команд.
             reason = params.get("reason") or "Запрошенная операция не поддерживается текущим набором команд ассистента."
             return unsupported_prefix + " " + str(reason)
-
         else:
             return (f"Ошибка: Неизвестная команда '{command}' в JSON-паспорте. "
                     f"Доступно: zoom_all, create_layer, switch_layout, switch_to_model, switch_to_sheet, "
-                    f"switch_to_drawing, change_object_color, change_layer_color, zoom_to_object, "
-                    f"get_property, read_data, inspect_object, modify_object, find_objects, select_by_type, "
-                    f"count_by_layer, list_layers, list_layouts, undo, unsupported.")
+                    f"switch_to_drawing, change_object_color, move_object_to_layer, change_layer_color, "
+                    f"zoom_to_object, get_property, read_data, inspect_object, modify_object, find_objects, "
+                    f"select_by_type, count_by_layer, list_layers, list_layouts, undo, unsupported.")
 
     except ValueError as e:
-        # Например, color_aci передали строкой, которую не удалось привести к int.
         return f"Ошибка значения параметров команды '{command}': {str(e)}"
     except Exception as e:
-        # Любой внутренний сбой движка (в т.ч. OLE/COM) — отправляется на Self-Healing.
         return f"Внутренний сбой движка при выполнении '{command}': {str(e)}"

@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
-"""agent_analyst.py — ИИ-агент «Аналитик» для чтения и инспекции чертежа.
+"""agent_analyst.py — ИИ-агент «Аналитик» (pyautocad, Блок 4 спецификации).
 
-Данный агент занимается исключительно чтением данных, инспекцией чертежей,
-проверкой геометрических пересечений и сбором статистики. Он НЕ вносит
-изменения в геометрию или свойства объектов.
+Данный агент занимается исключительно чтением данных, инспекцией чертежей и
+сбором статистики. Он НЕ вносит изменения в геометрию или свойства объектов.
+
+Работа выполняется СТРОГО через стабильную оболочку pyautocad:
+    - acad.app   -> цикл по коллекции Documents (открытые вкладки);
+    - acad.doc   -> Layers, Layouts, HandleToObject, Name, FullName;
+    - acad.model -> итерация по объектам с чтением .ObjectName.
 
 Основные возможности:
     1. Получение списка открытых чертежей, слоёв и листов (Layouts).
     2. Сводная статистика по типам объектов в Пространстве Модели.
-    3. Выбор объектов (выделенных пользователем либо всех) с возвратом Handle.
-    4. Анализ пересечений отрезков AcDbLine через line_intersection из core_core.
+    3. Чтение свойств объекта по его Handle через doc.HandleToObject().
+    4. Выбор объектов и анализ пересечений отрезков (обратная совместимость).
 
 Все аналитические инструменты оформлены как статичные Python-функции и
 возвращают структурированный JSON-совместимый словарь вида
 {"status": "success", "data": ...} либо {"status": "error", "message": ...}.
 
 Ключевые принципы:
-    - Внутри модуля НЕ используется exec()/eval().
-    - Для работы с COM используются объекты связи из core_core.
+    - Внутри модуля НЕ используется exec()/eval() и НЕ используется сырой
+      win32com.client — только статичные функции и методы pyautocad.
     - Все операции с коллекциями AutoCAD обёрнуты в try-except.
 
 Модуль сохраняет обратную совместимость: функции, используемые agent_operator.py
@@ -30,7 +34,8 @@ count_by_layer, list_layers, list_layouts, list_open_documents), остаютс�
 
 from __future__ import annotations
 
-from core_core import get_autocad_connection, acad_app, doc, model_space, line_intersection
+from pyautocad import APoint
+from core_core import ensure_connection, get_acad, line_intersection
 
 
 # Человекочитаемые названия типов примитивов AutoCAD (из ObjectName COM).
@@ -61,21 +66,18 @@ OBJECT_TYPE_NAMES = {
 def _ensure_connection():
     """Гарантирует актуальное подключение к AutoCAD и возвращает объекты связи.
 
-    Вызывает get_autocad_connection() из core_core, который заполняет глобальные
-    переменные acad_app, doc и model_space. При неудаче возвращает кортеж из None.
+    Сначала проверяет «пульс» COM-сессии через core_core.ensure_connection()
+    (с автоматическим восстановлением моста pyautocad при обрыве сессии
+    -2147220995 'Объект не подключен к серверу'). При неудаче возвращает кортеж
+    из None. Вызывается в начале каждой аналитической функции.
 
     Возвращает:
-        tuple (acad_app, doc, model_space) — объекты COM-связи AutoCAD.
+        tuple (app, doc, model) — объекты связи AutoCAD либо (None, None, None).
     """
-    global acad_app, doc, model_space
-    try:
-        app, current_doc, ms = get_autocad_connection()
-        acad_app = app
-        doc = current_doc
-        model_space = ms
-    except Exception:
-        pass
-    return acad_app, doc, model_space
+    if not ensure_connection():
+        return None, None, None
+    acad = get_acad()
+    return acad.app, acad.doc, acad.model
 
 
 def _err(message):
@@ -125,10 +127,9 @@ def _find_document_by_name(app, drawing_name):
     target = str(drawing_name).strip().lower()
     try:
         docs = app.Documents
-        for i in range(docs.Count):
-            candidate = docs.Item(i)
+        for candidate in docs:
             candidate_name = str(candidate.Name).strip().lower()
-            # Сравниваем как по полному имени с расширением, так и по базовому имени.
+            # Сравниваем как по полному имени с расширением, так и по базовому.
             if candidate_name == target or candidate_name.startswith(target):
                 return candidate
     except Exception:
@@ -137,27 +138,25 @@ def _find_document_by_name(app, drawing_name):
 
 
 # ========================================================================
-# АНАЛИТИЧЕСКИЕ ИНСТРУМЕНТЫ (JSON-ИНТЕРФЕЙС)
+# АНАЛИТИЧЕСКИЕ ИНСТРУМЕНТЫ (JSON-ИНТЕРФЕЙС) — БЛОК 4 СПЕЦИФИКАЦИИ
 # ========================================================================
 
 def get_open_drawings():
     """Возвращает список имён всех открытых вкладок чертежей в сессии AutoCAD.
 
-    Перебирает коллекцию Documents приложения и собирает имена всех открытых
-    файлов. Активный документ помечается суффиксом «(активный)».
+    Цикл перебора по коллекции документов acad.app.Documents (Блок 4
+    спецификации). Активный документ помечается суффиксом «(активный)».
 
     Возвращает:
         dict — {"status": "success", "data": [имена файлов]} либо ошибку.
     """
-    app, _, _ = _ensure_connection()
+    app, current_doc, _ = _ensure_connection()
     if app is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
-        active_name = str(app.ActiveDocument.Name)
-        docs = app.Documents
+        active_name = str(current_doc.Name)
         names = []
-        for i in range(docs.Count):
-            d = docs.Item(i)
+        for d in app.Documents:
             label = str(d.Name)
             if str(d.Name) == active_name:
                 label += " (активный)"
@@ -170,8 +169,9 @@ def get_open_drawings():
 def get_layers_list(drawing_name: str = None):
     """Возвращает список имён всех существующих слоёв.
 
-    Если drawing_name передан, функция ищет этот документ среди открытых файлов
-    и читает слои из него; иначе — из текущего активного документа.
+    Цикл перебора коллекции слоёв acad.doc.Layers (Блок 4 спецификации). Если
+    drawing_name передан, функция ищет этот документ среди открытых файлов и
+    читает слои из него; иначе — из текущего активного документа.
 
     Аргументы:
         drawing_name: имя чертежа (необязательно), из которого нужно прочитать слои.
@@ -179,7 +179,7 @@ def get_layers_list(drawing_name: str = None):
     Возвращает:
         dict — {"status": "success", "data": [имена слоёв]} либо ошибку.
     """
-    app, current_doc, _ = _ensure_connection()
+    app, _, _ = _ensure_connection()
     if app is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
@@ -195,9 +195,9 @@ def get_layers_list(drawing_name: str = None):
 def get_sheets_list(drawing_name: str = None):
     """Возвращает список всех листов (Layouts) в файле, исключая «Model».
 
-    Если drawing_name передан, функция ищет документ среди открытых файлов;
-    иначе — читает листы из текущего активного документа. Пространство модели
-    («Model») всегда исключается из результата.
+    Цикл перебора коллекции листов acad.doc.Layouts (Блок 4 спецификации) с
+    фильтром ly.Name != "Model". Если drawing_name передан, функция ищет документ
+    среди открытых файлов; иначе — читает листы из активного документа.
 
     Аргументы:
         drawing_name: имя чертежа (необязательно), из которого нужно прочитать листы.
@@ -205,19 +205,15 @@ def get_sheets_list(drawing_name: str = None):
     Возвращает:
         dict — {"status": "success", "data": [имена листов]} либо ошибку.
     """
-    app, current_doc, _ = _ensure_connection()
+    app, _, _ = _ensure_connection()
     if app is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
         target_doc = _find_document_by_name(app, drawing_name)
         if target_doc is None:
             return _err(f"Файл '{drawing_name}' не найден среди открытых вкладок")
-        sheets = []
-        for layout in target_doc.Layouts:
-            name = str(layout.Name)
-            # Исключаем пространство модели, которое не является листом печати.
-            if name.lower() != "model":
-                sheets.append(name)
+        # Исключаем пространство модели, которое не является листом печати.
+        sheets = [ly.Name for ly in target_doc.Layouts if ly.Name != "Model"]
         return _ok(sheets, "Получен список листов.")
     except Exception as e:
         return _err(f"Ошибка чтения списка листов: {e}")
@@ -226,18 +222,19 @@ def get_sheets_list(drawing_name: str = None):
 def analyze_objects_summary():
     """Сканирует Пространство Модели и возвращает сводную статистику по объектам.
 
-    Проходит по всем объектам ModelSpace активного чертежа и подсчитывает, сколько
-    и каких типов объектов (например, AcDbCircle, AcDbLine) находится на чертеже.
+    Итерация по пространству модели acad.model с чтением свойства .ObjectName
+    (Блок 4 спецификации). Подсчитывает, сколько и каких типов объектов находится
+    на чертеже.
 
     Возвращает:
         dict — {"status": "success", "data": {тип: количество}} либо ошибку.
     """
-    _, current_doc, ms = _ensure_connection()
-    if current_doc is None or ms is None:
+    _, _, model = _ensure_connection()
+    if model is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
         summary = {}
-        for obj in ms:
+        for obj in model:
             raw = str(getattr(obj, "ObjectName", "") or "").strip()
             if not raw:
                 continue
@@ -245,6 +242,113 @@ def analyze_objects_summary():
         return _ok(summary, "Сводная статистика по объектам собрана.")
     except Exception as e:
         return _err(f"Ошибка сканирования пространства модели: {e}")
+
+
+def get_object_properties_by_handle(handle: str):
+    """Читает свойства конкретного объекта по его Handle (Блок 4 спецификации).
+
+    Находит объект через acad.doc.HandleToObject(handle) и собирает словарь его
+    базовых свойств: тип, слой, цвет ACI, длина/периметр, площадь, координаты.
+
+    Аргументы:
+        handle: строковый Handle (паспорт) объекта в чертеже.
+
+    Возвращает:
+        dict — {"status": "success", "data": {...}} либо ошибку.
+    """
+    _, current_doc, _ = _ensure_connection()
+    if current_doc is None:
+        return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+    if not handle or not str(handle).strip():
+        return _err("Не задан Handle объекта для чтения свойств.")
+    try:
+        target_obj = current_doc.HandleToObject(str(handle))
+    except Exception:
+        return _err(f"Объект с Handle '{handle}' не найден в чертеже.")
+
+    props = {"handle": str(handle)}
+    # Читаем базовые свойства (тип, слой, цвет ACI).
+    for key, attr in (("object_name", "ObjectName"), ("layer", "Layer"),
+                      ("color_aci", "Color")):
+        try:
+            props[key] = getattr(target_obj, attr)
+        except Exception:
+            pass
+    # Читаем геометрические метрики, если они поддерживаются.
+    for key, attr in (("length", "Length"), ("area", "Area")):
+        try:
+            props[key] = float(getattr(target_obj, attr))
+        except Exception:
+            pass
+    # Читаем координаты вершин (полилинии/мультиточки), если доступны.
+    try:
+        coords = list(target_obj.Coordinates)
+        props["coordinates"] = [float(c) for c in coords[:8]]
+    except Exception:
+        pass
+    return _ok(props, f"Свойства объекта '{handle}' прочитаны.")
+
+
+def get_intersection_points(handle1: str, handle2: str):
+    """Находит истинные CAD-координаты точек пересечения двух объектов.
+
+    Получает оба объекта через acad.doc.HandleToObject() и вызывает официальный
+    метод AutoCAD ActiveX obj1.IntersectWith(obj2, 0) (см. справочник
+    cad_reference.md). Метод возвращает плоский кортеж координат
+    (X1, Y1, Z1, X2, Y2, Z2, ...). Парсер разбивает его по 3 элемента и
+    упаковывает каждую точку в нативный APoint.
+
+    Аргументы:
+        handle1: строковый Handle первого объекта (например, квадрата).
+        handle2: строковый Handle второго объекта (например, круга).
+
+    Возвращает:
+        dict — {"status": "success", "data": [[x, y], ...]} с массивом истинных
+               CAD-координат точек пересечения, либо ошибку.
+    """
+    if not _ensure_connection():
+        return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+    if not handle1 or not handle2:
+        return _err("Для поиска пересечений необходимы Handles двух объектов.")
+    try:
+        # Получаем оба объекта как полноценные CAD-сущности.
+        try:
+            obj1 = get_acad().doc.HandleToObject(str(handle1))
+        except Exception:
+            return _err(f"Объект с Handle '{handle1}' не найден в чертеже.")
+        try:
+            obj2 = get_acad().doc.HandleToObject(str(handle2))
+        except Exception:
+            return _err(f"Объект с Handle '{handle2}' не найден в чертеже.")
+
+        # Официальный метод ActiveX: режим 0 — без продления граней.
+        # Возвращает плоский кортеж (X1, Y1, Z1, X2, Y2, Z2, ...).
+        raw = obj1.IntersectWith(obj2, 0)
+
+        # Парсер: разбиваем кортеж по 3 координаты и упаковываем в APoint.
+        points = []
+        coords = list(raw) if raw is not None else []
+        for i in range(0, len(coords), 3):
+            x = float(coords[i])
+            y = float(coords[i + 1]) if i + 1 < len(coords) else 0.0
+            pt = APoint(x, y, 0.0)
+            points.append([pt.x, pt.y])
+
+        # Очистка от дубликатов: сложные фигуры могут возвращать накладывающиеся
+        # точки. Округляем координаты до 3 знаков после запятой и оставляем только
+        # уникальные пары (X, Y), чтобы в ответ и круги-маркеры не дублировались.
+        unique_points = []
+        seen = set()
+        for (px, py) in points:
+            key = (round(float(px), 3), round(float(py), 3))
+            if key not in seen:
+                seen.add(key)
+                unique_points.append([key[0], key[1]])
+
+        return _ok(unique_points,
+                   f"Найдено точек пересечения: {len(unique_points)}.")
+    except Exception as e:
+        return _err(f"Ошибка поиска точек пересечения: {e}")
 
 
 def get_selected_or_all_objects():
@@ -258,8 +362,8 @@ def get_selected_or_all_objects():
     Возвращает:
         dict — {"status": "success", "data": [handle, ...]} либо ошибку.
     """
-    _, current_doc, ms = _ensure_connection()
-    if current_doc is None or ms is None:
+    _, current_doc, model = _ensure_connection()
+    if current_doc is None or model is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
         handles = []
@@ -273,7 +377,7 @@ def get_selected_or_all_objects():
         except Exception:
             pass
         # Резервный вариант: все объекты Пространства Модели.
-        for obj in ms:
+        for obj in model:
             try:
                 handles.append(str(obj.Handle))
             except Exception:
@@ -286,20 +390,20 @@ def get_selected_or_all_objects():
 def check_lines_intersections():
     """Находит все точки пересечения отрезков AcDbLine в Пространстве Модели.
 
-    Перебирает все отрезки в ModelSpace и попарно сравнивает их с помощью
+    Перебирает все отрезки в acad.model и попарно сравнивает их с помощью
     line_intersection из core_core. Каждая найденная точка пересечения
     добавляется в список координат.
 
     Возвращает:
         dict — {"status": "success", "data": [[x, y], ...]} либо ошибку.
     """
-    _, current_doc, ms = _ensure_connection()
-    if current_doc is None or ms is None:
+    _, _, model = _ensure_connection()
+    if model is None:
         return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
     try:
         # Собираем все отрезки AcDbLine с их конечными точками.
         lines = []
-        for obj in ms:
+        for obj in model:
             try:
                 if str(getattr(obj, "ObjectName", "")) != "AcDbLine":
                     continue
@@ -316,7 +420,7 @@ def check_lines_intersections():
             for j in range(i + 1, len(lines)):
                 pt = line_intersection(lines[i], lines[j])
                 if pt is not None:
-                    # Округляем координаты до двух знаков для компактности результата.
+                    # Округляем координаты до двух знаков для компактности.
                     x, y = round(float(pt[0]), 2), round(float(pt[1]), 2)
                     if [x, y] not in intersections:
                         intersections.append([x, y])
@@ -572,8 +676,7 @@ def list_open_documents(acad_app):
         docs = acad_app.Documents
         active_name = str(acad_app.ActiveDocument.Name)
         rows = []
-        for i in range(docs.Count):
-            d = docs.Item(i)
+        for d in docs:
             mark = " (активный)" if str(d.Name) == active_name else ""
             rows.append(f"  {d.Name}{mark}")
         if not rows:

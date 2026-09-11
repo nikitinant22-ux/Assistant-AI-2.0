@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
-"""agent_draftsman.py — ИИ-агент «Чертёжник» для создания и привязки геометрии.
+"""agent_draftsman.py — ИИ-агент «Чертёжник» (pyautocad).
 
-Данный модуль отвечает за роль Ассистента-Чертёжника: он занимается
-исключительно созданием и точной привязкой геометрии в пространстве чертежа
-AutoCAD. Реализованные инструменты оформлены как статичные Python-функции,
-принимают только базовые типы данных и всегда возвращают структурированный
-JSON-совместимый словарь (например, {"status": "success", "handle": ...}).
+Данный модуль отвечает за роль Ассистента-Чертёжника: он занимается исключительно
+созданием и точной привязкой геометрии в пространстве модели AutoCAD. Все
+инструменты оформлены как статичные Python-функции, принимают только базовые
+типы данных (int, float, str, list) и всегда возвращают структурированный
+JSON-совместимый словарь вида {"status": "success", "handle": ...}.
+
+Работа выполняется СТРОГО через стабильную оболочку pyautocad:
+    - acad.model  -> пространство модели (AddLine, AddCircle, ...);
+    - to_cad_point() -> нативный класс точки APoint из core_core.
 
 Ключевые принципы:
-    1. Все координаты перед передачей в COM упаковываются в double-массив
-       Windows через core_core.to_cad_point().
+    1. Все координаты перед передачей в ActiveX упаковываются в APoint через
+       core_core.to_cad_point().
     2. Внутри модуля НЕ используется exec()/eval() — только статичные функции.
-    3. После построения объекта обязательно вызывается update_screen(), чтобы
-       пользователь сразу увидел результат.
+    3. После построения объекта обязательно вызывается update_screen()
+       (внутри — acad.doc.Regen(1)).
     4. Вся работа с AutoCAD обёрнута в try-except: при ошибке возвращается
        статус {"status": "error", "message": "..."} на русском языке.
 
@@ -21,9 +25,8 @@ JSON-совместимый словарь (например, {"status": "succes
 
 from __future__ import annotations
 
-import array  # безопасная упаковка координат в одномерный double-массив
-
-from core_core import get_autocad_connection, model_space, doc, to_cad_point, update_screen
+# Главный объект связи pyautocad и фабрика double-массивов для полилиний.
+from core_core import ensure_connection, get_acad, to_cad_point, update_screen
 
 
 # ========================================================================
@@ -33,21 +36,16 @@ from core_core import get_autocad_connection, model_space, doc, to_cad_point, up
 def _ensure_connection():
     """Гарантирует актуальное подключение к AutoCAD.
 
-    Вызывает get_autocad_connection() из core_core, который заполняет
-    глобальные переменные acad_app, doc и model_space. Если AutoCAD не запущен —
-    глобальные ссылки остаются прежними (или None), а функция возвращает False.
+    Делегирует проверку «пульса» COM-сессии в core_core.ensure_connection(),
+    которая при обрыве (-2147220995 'Объект не подключен к серверу') на лету
+    пересоздаёт мост pyautocad. Вызывается в начале каждой чертёжной функции,
+    чтобы исключить падение последующих команд в цепочке запросов инженера.
 
     Возвращает:
-        bool — True, если соединение с AutoCAD установлено и model_space доступен.
+        bool — True, если связь жива или успешно восстановлена;
+               False — если AutoCAD физически закрыт.
     """
-    global model_space, doc
-    try:
-        acad_app, current_doc, ms = get_autocad_connection()
-        doc = current_doc
-        model_space = ms
-        return model_space is not None
-    except Exception:
-        return False
+    return ensure_connection()
 
 
 def _ok(handle, message):
@@ -76,15 +74,14 @@ def _err(message):
 
 
 # ========================================================================
-# ГЕОМЕТРИЧЕСКИЕ ИНСТРУМЕНТЫ ЧЕРТЁЖНИКА
+# ГЕОМЕТРИЧЕСКИЕ ИНСТРУМЕНТЫ ЧЕРТЁЖНИКА (БЛОКИ 1-3 СПЕЦИФИКАЦИИ)
 # ========================================================================
 
 def draw_circle(x: float, y: float, radius: float, color: int = 7):
-    """Строит круг в пространстве модели.
+    """Строит круг в пространстве модели (Блок 1: acad.model.AddCircle).
 
-    Координаты центра обязательно пропускаются через to_cad_point(), что
-    гарантирует корректную упаковку в COM double-массив. Возвращается Handle
-    созданного круга для дальнейшего взаимодействия с ним других агентов.
+    Центр пропускается через to_cad_point() и превращается в APoint, радиус
+    приводится к float. Возвращается Handle созданного круга.
 
     Аргументы:
         x: координата X центра круга.
@@ -99,9 +96,8 @@ def draw_circle(x: float, y: float, radius: float, color: int = 7):
     try:
         if not _ensure_connection():
             return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
-
-        center = to_cad_point(float(x), float(y))
-        circle = model_space.AddCircle(center, float(radius))
+        center = to_cad_point(x, y)
+        circle = get_acad().model.AddCircle(center, float(radius))
         # Применяем заданный цвет ACI, если он отличается от стандартного.
         if int(color) != 7:
             try:
@@ -114,15 +110,42 @@ def draw_circle(x: float, y: float, radius: float, color: int = 7):
         return _err(f"Ошибка построения круга: {e}")
 
 
-def draw_polyline(points_list: list, is_closed: bool = False):
-    """Строит лёгкую полилинию (LightWeightPolyline) по списку плоских координат.
+def draw_line(x1: float, y1: float, x2: float, y2: float):
+    """Строит отрезок между двумя точками (Блок 1: acad.model.AddLine).
 
-    Список вида [[x1, y1], [x2, y2], ...] преобразуется в одномерный double-массив
-    array.array('d', [x1, y1, x2, y2, ...]), как это требует AddLightWeightPolyline.
-    При is_closed=True задаётся свойство Closed, замыкающее контур.
+    Обе конечные точки упаковываются в APoint через to_cad_point().
 
     Аргументы:
-        points_list: список точек [[x1, y1], [x2, y2], ...].
+        x1, y1: координаты первой конечной точки отрезка.
+        x2, y2: координаты второй конечной точки отрезка.
+
+    Возвращает:
+        dict — {"status": "success", "handle": "...", "message": "..."}
+               либо {"status": "error", "message": "..."} при ошибке.
+    """
+    try:
+        if not _ensure_connection():
+            return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+        start = to_cad_point(x1, y1)
+        end = to_cad_point(x2, y2)
+        line = get_acad().model.AddLine(start, end)
+        update_screen()
+        return _ok(line.Handle,
+                   f"Отрезок построен от ({x1}, {y1}) до ({x2}, {y2}).")
+    except Exception as e:
+        return _err(f"Ошибка построения отрезка: {e}")
+
+
+def draw_polyline(points_list: list, is_closed: bool = False):
+    """Строит лёгкую полилинию (LWPolyline) по плоскому массиву координат.
+
+    Список вида [[x1, y1], [x2, y2], ...] (или плоский [x1, y1, x2, y2, ...])
+    разворачивается в одномерный double-массив и передаётся в метод
+    acad.model.AddLightWeightPolyline (Блок 1). При is_closed=True задаётся
+    свойство Closed, замыкающее контур.
+
+    Аргументы:
+        points_list: список вершин (плоский либо список пар/кортежей).
         is_closed: флаг замкнутости полилинии.
 
     Возвращает:
@@ -131,18 +154,18 @@ def draw_polyline(points_list: list, is_closed: bool = False):
     try:
         if not _ensure_connection():
             return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
-
         if not points_list or len(points_list) < 2:
             return _err("Для построения полилинии необходимо минимум две точки.")
 
-        # Разворачиваем список пар координат в плоский одномерный массив double.
+        # Разворачиваем вход (плоский или список пар) в плоский double-массив.
         flat = []
-        for px, py in points_list:
-            flat.append(float(px))
-            flat.append(float(py))
-        vertices = array.array("d", flat)
+        for item in points_list:
+            if isinstance(item, (list, tuple)):
+                flat.extend(float(c) for c in item[:2])
+            else:
+                flat.append(float(item))
 
-        poly = model_space.AddLightWeightPolyline(vertices)
+        poly = get_acad().model.AddLightWeightPolyline(get_acad().aDouble(flat))
         # Задаём замкнутость контура по требованию.
         try:
             poly.Closed = bool(is_closed)
@@ -157,8 +180,9 @@ def draw_polyline(points_list: list, is_closed: bool = False):
 def draw_rectangle(x1: float, y1: float, x2: float, y2: float):
     """Строит замкнутый прямоугольник по двум противоположным углам.
 
-    Реализован через вызов draw_polyline() с четырьмя вершинами и флагом
-    is_closed=True — это экономит код и гарантирует единообразную логику.
+    Капсульный алгоритм по 4 точкам: формируется плоский массив
+    [x1, y1, x2, y1, x2, y2, x1, y2] и вызывается AddLightWeightPolyline с
+    последующим .Closed = True (Блок 1 спецификации).
 
     Аргументы:
         x1, y1: координаты первого противоположного угла.
@@ -168,21 +192,96 @@ def draw_rectangle(x1: float, y1: float, x2: float, y2: float):
         dict — результат операции построения (успех или ошибка).
     """
     try:
+        if not _ensure_connection():
+            return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
         fx1, fy1, fx2, fy2 = float(x1), float(y1), float(x2), float(y2)
-        # Четыре вершины прямоугольника по часовой стрелке (контур замкнут).
-        points = [
-            [fx1, fy1],
-            [fx2, fy1],
-            [fx2, fy2],
-            [fx1, fy2],
-        ]
-        result = draw_polyline(points, is_closed=True)
-        if result.get("status") == "success":
-            result["message"] = (f"Прямоугольник построен от ({fx1}, {fy1}) "
-                                 f"до ({fx2}, {fy2}).")
-        return result
+        # Капсульный алгоритм: 4 вершины прямоугольника по часовой стрелке.
+        flat = [fx1, fy1, fx2, fy1, fx2, fy2, fx1, fy2]
+        rect = get_acad().model.AddLightWeightPolyline(get_acad().aDouble(flat))
+        # Замыкаем контур прямоугольника.
+        try:
+            rect.Closed = True
+        except Exception:
+            pass
+        update_screen()
+        return _ok(rect.Handle,
+                   f"Прямоугольник построен от ({fx1}, {fy1}) до ({fx2}, {fy2}).")
     except Exception as e:
         return _err(f"Ошибка построения прямоугольника: {e}")
+
+
+def draw_text(text: str, x: float, y: float, height: float = 2.5):
+    """Вставляет однострочный текст (Блок 2: acad.model.AddText).
+
+    Аргументы:
+        text: строка текста для вставки.
+        x, y: координаты точки вставки текста.
+        height: высота шрифта (по умолчанию 2.5).
+
+    Возвращает:
+        dict — результат операции (успех с Handle или ошибка).
+    """
+    try:
+        if not _ensure_connection():
+            return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+        txt = str(text)
+        point = to_cad_point(x, y)
+        obj = get_acad().model.AddText(txt, point, float(height))
+        update_screen()
+        return _ok(obj.Handle, f"Текст \"{txt}\" вставлен в точке ({x}, {y}).")
+    except Exception as e:
+        return _err(f"Ошибка вставки текста: {e}")
+
+
+def draw_mtext(text: str, x: float, y: float, width: float = 100.0):
+    """Вставляет многострочный текст (Блок 2: acad.model.AddMText).
+
+    Аргументы:
+        text: строка текста для вставки (поддерживает многострочность).
+        x, y: координаты точки вставки.
+        width: ширина ограничивающей рамки МText (по умолчанию 100.0).
+
+    Возвращает:
+        dict — результат операции (успех с Handle или ошибка).
+    """
+    try:
+        if not _ensure_connection():
+            return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+        txt = str(text)
+        point = to_cad_point(x, y)
+        obj = get_acad().model.AddMText(point, float(width), txt)
+        update_screen()
+        return _ok(obj.Handle, f"Многострочный текст вставлен в точке ({x}, {y}).")
+    except Exception as e:
+        return _err(f"Ошибка вставки многострочного текста: {e}")
+
+
+def insert_block(block_name: str, x: float, y: float,
+                 scale: float = 1.0, rotation_rad: float = 0.0):
+    """Вставляет блок (Блок 3: acad.model.InsertBlock).
+
+    Равномерно масштабирует блок по трём осям и задаёт угол поворота в радианах.
+
+    Аргументы:
+        block_name: имя существующего блока в чертеже.
+        x, y: координаты точки вставки блока.
+        scale: коэффициент масштабирования (по умолчанию 1.0).
+        rotation_rad: угол поворота блока в радианах (по умолчанию 0.0).
+
+    Возвращает:
+        dict — результат операции (успех с Handle или ошибка).
+    """
+    try:
+        if not _ensure_connection():
+            return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+        point = to_cad_point(x, y)
+        s = float(scale)
+        obj = get_acad().model.InsertBlock(
+            point, str(block_name), s, s, s, float(rotation_rad))
+        update_screen()
+        return _ok(obj.Handle, f"Блок \"{block_name}\" вставлен в точке ({x}, {y}).")
+    except Exception as e:
+        return _err(f"Ошибка вставки блока: {e}")
 
 
 def draw_ellipse(center_x: float, center_y: float,
@@ -191,12 +290,11 @@ def draw_ellipse(center_x: float, center_y: float,
 
     Метод AddEllipse требует точку центра, конечную точку большой оси и
     соотношение малого радиуса к большому (radius_ratio). Все координаты
-    строго типизируются через to_cad_point() в COM double-массивы.
+    строго типизируются через to_cad_point() в нативные APoint.
 
     Аргументы:
         center_x, center_y: координаты центра эллипса.
-        major_x, major_y: координаты конечной точки вектора большой оси
-            (относительно мировых координат, а не смещение от центра).
+        major_x, major_y: координаты конечной точки вектора большой оси.
         radius_ratio: соотношение радиусов (малый / большой), значение 0..1.
 
     Возвращает:
@@ -205,14 +303,12 @@ def draw_ellipse(center_x: float, center_y: float,
     try:
         if not _ensure_connection():
             return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
-
         ratio = float(radius_ratio)
         if not (0.0 < ratio <= 1.0):
             return _err("Соотношение радиусов эллипса должно быть в диапазоне (0, 1].")
-
-        center = to_cad_point(float(center_x), float(center_y))
-        major_end = to_cad_point(float(major_x), float(major_y))
-        ellipse = model_space.AddEllipse(center, major_end, ratio)
+        center = to_cad_point(center_x, center_y)
+        major_end = to_cad_point(major_x, major_y)
+        ellipse = get_acad().model.AddEllipse(center, major_end, ratio)
         update_screen()
         return _ok(ellipse.Handle,
                    f"Эллипс построен: центр ({center_x}, {center_y}), "
@@ -224,7 +320,7 @@ def draw_ellipse(center_x: float, center_y: float,
 def fit_object_in_circle(object_handle: str, padding: float = 10.0):
     """Описывает существующий объект в окружность.
 
-    По уникальному Handle объект находится через doc.HandleToObject(). Затем
+    По уникальному Handle объект находится через acad.doc.HandleToObject(). Затем
     считываются его габариты методом .GetBoundingBox(), вычисляется геометрический
     центр и радиус (половина диагонали ограничивающей рамки + отступ padding).
     Вокруг объекта автоматически строится красная окружность (Color = 1).
@@ -239,13 +335,12 @@ def fit_object_in_circle(object_handle: str, padding: float = 10.0):
     try:
         if not _ensure_connection():
             return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
-
         if not object_handle:
             return _err("Не задан Handle объекта для описания в окружность.")
 
         # Находим объект в базе чертежа по его уникальному дескриптору.
         try:
-            target_obj = doc.HandleToObject(str(object_handle))
+            target_obj = get_acad().doc.HandleToObject(str(object_handle))
         except Exception:
             return _err(f"Объект с Handle '{object_handle}' не найден в чертеже.")
 
@@ -263,7 +358,7 @@ def fit_object_in_circle(object_handle: str, padding: float = 10.0):
 
         # Строим описывающую окружность красного цвета (Color = 1).
         center = to_cad_point(cx, cy)
-        circle = model_space.AddCircle(center, radius)
+        circle = get_acad().model.AddCircle(center, radius)
         try:
             circle.Color = 1
         except Exception:
@@ -275,32 +370,102 @@ def fit_object_in_circle(object_handle: str, padding: float = 10.0):
         return _err(f"Ошибка описания объекта в окружность: {e}")
 
 
+def fit_circle_to_object(object_handle: str, mode: str = "described"):
+    """Вписывает или описывает окружность вокруг объекта по его Handle.
+
+    Универсальный математический алгоритм на базе метода GetBoundingBox:
+        1. Объект находится через acad.doc.HandleToObject(object_handle).
+        2. Считываются крайние точки габаритов min_pt и max_pt.
+        3. Вычисляется геометрический центр ограничивающей рамки.
+        4. Радиус окружности зависит от выбранного режима:
+           - mode == "described" (Описать СНАРУЖИ): половина диагонали рамки;
+           - mode == "inscribed"  (Вписать ВНУТРЬ):  половина меньшей стороны.
+        5. Строится окружность (acad.model.AddCircle) красного цвета (Color = 1).
+
+    Аргументы:
+        object_handle: строковый Handle существующего объекта в чертеже.
+        mode: режим подгонки — "described" (описать снаружи, по умолчанию)
+              либо "inscribed" (вписать внутрь).
+
+    Возвращает:
+        dict — результат операции (успех с Handle круга или ошибка).
+    """
+    try:
+        if not _ensure_connection():
+            return _err("Не удалось подключиться к AutoCAD. Проверьте, что программа запущена.")
+        if not object_handle:
+            return _err("Не задан Handle объекта для подгонки окружности.")
+        if mode not in ("described", "inscribed"):
+            return _err(f"Неизвестный режим '{mode}'. Допустимо: described | inscribed.")
+
+        # Находим объект в базе чертежа по его уникальному дескриптору.
+        try:
+            target_obj = get_acad().doc.HandleToObject(str(object_handle))
+        except Exception:
+            return _err(f"Объект с Handle '{object_handle}' не найден в чертеже.")
+
+        # Считываем ограничивающую рамку объекта (крайние точки габаритов).
+        min_pt, max_pt = target_obj.GetBoundingBox()
+
+        # Математический расчёт геометрического центра рамки.
+        cx = (float(min_pt[0]) + float(max_pt[0])) / 2.0
+        cy = (float(min_pt[1]) + float(max_pt[1])) / 2.0
+
+        # Ширина и высота ограничивающей рамки.
+        width = float(max_pt[0]) - float(min_pt[0])
+        height = float(max_pt[1]) - float(min_pt[1])
+
+        # Радиус окружности зависит от выбранного режима подгонки.
+        if mode == "inscribed":
+            # Вписать ВНУТРЬ: радиус равен половине меньшей стороны рамки.
+            radius = min(width, height) / 2.0
+            label = "вписанная"
+        else:
+            # Описать СНАРУЖИ: радиус равен половине диагонали рамки.
+            radius = ((width ** 2 + height ** 2) ** 0.5) / 2.0
+            label = "описанная"
+
+        # Строим окружность и выделяем её красным цветом (Color = 1).
+        center = to_cad_point(cx, cy)
+        circle = get_acad().model.AddCircle(center, radius)
+        try:
+            circle.Color = 1
+        except Exception:
+            pass
+        update_screen()
+        return _ok(circle.Handle,
+                   f"{label.capitalize()} окружность ({mode}) радиусом {radius:.2f} "
+                   f"построена вокруг объекта '{object_handle}'.")
+    except Exception as e:
+        return _err(f"Ошибка подгонки окружности под объект: {e}")
+
+
 # ========================================================================
 # ЖЁСТКИЕ ПРАВИЛА РАБОТЫ С AUTOCAD (общие для всех ИИ-агентов)
 # ========================================================================
-# Эти текстовые правила перенесены из прежнего модуля cad_agent_brain.py и
-# встраиваются в системный промпт каждого агента, чтобы модель не совершала
-# типовых ошибок при взаимодействии с COM API.
+# Правила, встраиваемые в системный промпт, чтобы модель не совершала типовых
+# ошибок при работе через pyautocad и нативный класс точек APoint.
 
 AUTOCAD_RULES: str = (
-    "═══ УЛЬТИМАТИВНОЕ ПРАВИЛО ТИПИЗАЦИИ COM API (ЗАЩИТА ОТ СБОЕВ ТИПОВ) ═══\n"
+    "═══ УЛЬТИМАТИВНОЕ ПРАВИЛО ТИПИЗАЦИИ PYTHON -> AUTOCAD ═══\n"
     "AutoCAD COM НЕ принимает нативные списки Python (вроде [x, y, z]). Каждый раз, "
-    "когда ты передаёшь точку, вектор или массив координат (Point, Center, FromPoint, "
-    "ToPoint, InsertionPoint, VerticesList и аналогичные) — ОБЯЗАН упаковывать их в "
-    "double-массив Windows. Используй готовую функцию core_core.to_cad_point():\n"
+    "когда ты передаёшь точку, вектор или массив координат (Point, Center, "
+    "InsertionPoint, VerticesList и аналогичные) — ОБЯЗАН упаковывать их в нативный "
+    "класс точек pyautocad APoint. Используй готовую функцию core_core.to_cad_point():\n"
     "    from core_core import to_cad_point\n"
     "    pt = to_cad_point(x, y, z)\n"
     "Это гарантирует тип array.array('d', ...), понятный AutoCAD ActiveX.\n\n"
 
     "═══ ПРАВИЛО РАБОТЫ С УГЛАМИ (РАДИАНЫ) ═══\n"
-    "Все тригонометрические методы AutoCAD (Rotate и др.) принимают углы ТОЛЬКО в "
-    "радианах. Если пользователь указал угол в градусах — приведи его к радианам "
-    "через math.radians(angle_deg). Никогда не передавай градусы напрямую в Rotate.\n\n"
+    "Все тригонометрические методы AutoCAD (Rotate, InsertBlock и др.) принимают "
+    "углы ТОЛЬКО в радианах. Если пользователь указал угол в градусах — приведи "
+    "его к радианам через math.radians(angle_deg). Никогда не передавай градусы "
+    "напрямую в Rotate.\n\n"
 
     "═══ ПРАВИЛО ОБНОВЛЕНИЯ ЭКРАНА (РЕГЕНЕРАЦИЯ) ═══\n"
     "После любого построения или изменения объекта вызывай update_screen() из "
-    "core_core (внутри она делает doc.Update()), чтобы пользователь сразу увидел "
-    "результат. Для массовых изменений прими используется doc.Regen(1).\n"
+    "core_core (внутри она делает acad.doc.Regen(1)), чтобы пользователь сразу "
+    "увидел результат. Для массовых изменений также используется doc.Regen(1).\n"
 )
 
 
@@ -333,11 +498,11 @@ SYSTEM_PROMPT: str = (
     '{"command": "имя_команды", "params": { ... }}\n'
     "Весь текст до этого блока (Блок А) парсер полностью игнорирует.\n\n"
 
-    "ДОСТУП К ОБЪЕКТАМ AUTOCAD (через фундамент core_core):\n"
-    "- model_space — пространство модели (AddLine, AddCircle, AddLightWeightPolyline, AddText).\n"
-    "- doc — активный документ (Name, FullName, Layers, Layouts, ModelSpace).\n"
-    "- app — COM Application (ZoomExtents).\n"
-    "Для любых координат используй core_core.to_cad_point().\n\n"
+    "ДОСТУП К ОБЪЕКТАМ AUTOCAD (через фундамент core_core и pyautocad):\n"
+    "- acad.model — пространство модели (AddLine, AddCircle, AddLightWeightPolyline, AddText).\n"
+    "- acad.doc — активный документ (Name, FullName, Layers, Layouts, HandleToObject).\n"
+    "- acad.app — COM Application (ZoomExtents).\n"
+    "Для любых координат используй core_core.to_cad_point(), возвращающую APoint.\n\n"
 
     + AUTOCAD_RULES +
 
