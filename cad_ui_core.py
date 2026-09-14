@@ -410,6 +410,13 @@ class MessageRow(QWidget):
         self._label.setObjectName("aiAnswer")
         self._label.setWordWrap(True)
         self._label.setMaximumWidth(700)
+        # Горизонтально метка занимает всю доступную ширину (до 700px), а не
+        # схлопывается в узкий столбец под свой sizeHint. Высота при wordWrap
+        # вычисляется через heightForWidth и растёт под полный текст ответа.
+        self._label.setMinimumWidth(0)
+        self._label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         self._label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._spoiler = None          # спойлер мыслей создаётся лениво
         self._ai_wrap = QWidget(self)
@@ -492,6 +499,17 @@ class MessageRow(QWidget):
         self._mount_ai()
         return self
 
+    def _refresh_ai_geometry(self) -> None:
+        """Пересчитывает геометрию растущего при стриминге ответа ИИ.
+
+        НЕ вызываем adjustSize(): для метки с wordWrap он схлопывает её в узкий
+        столбец по собственному sizeHint. Вместо этого просто помечаем обёртку и
+        строку как «изменившиеся», чтобы раскладка пересчитала высоту через
+        heightForWidth — так ответ занимает всю ширину и показывается целиком.
+        """
+        self._ai_wrap.updateGeometry()
+        self.updateGeometry()
+
     def set_ai_stream(self, answer: str, thinking: str = "") -> None:
         """Обновляет текст ответа и (при наличии) блок мыслей на лету.
 
@@ -506,6 +524,7 @@ class MessageRow(QWidget):
                 self._spoiler = ThinkingSpoiler(self)
                 self._ai_layout.insertWidget(0, self._spoiler)
             self._spoiler.update_thinking(thinking)
+        self._refresh_ai_geometry()
 
     def set_thinking_only(self, thinking: str) -> None:
         """Обновляет ТОЛЬКО блок мыслей Дипсика, не трогая текст ответа.
@@ -520,6 +539,7 @@ class MessageRow(QWidget):
                 self._spoiler = ThinkingSpoiler(self)
                 self._ai_layout.insertWidget(0, self._spoiler)
             self._spoiler.update_thinking(thinking)
+        self._refresh_ai_geometry()
 
     def finish_ai_stream(self) -> None:
         """Завершает потоковую генерацию (сейчас — декоративная точка расширения)."""
@@ -1427,8 +1447,10 @@ class MainWindow(QMainWindow):
 
         При потоковой генерации текст строки растёт быстро. Если не актуализировать
         геометрию вьюпорта на каждом чанке, длинное сообщение клипается по нижнему
-        краю области прокрутки и кажется «оборванным». Явный activate() пересобирает
-        раскладку, после чего растущее сообщение отображается в полном объёме.
+        краю области прокрутки и кажется «оборванным». activate() пересобирает
+        раскладку, а сама прокрутка откладывается в следующий цикл обработки
+        событий (QTimer.singleShot), чтобы раскладка успела завершиться ДО скролла —
+        иначе прокрутка опережает рост контента, и низ сообщения остаётся скрытым.
         """
         widget = self._scroll.widget()
         if widget is not None:
@@ -1436,7 +1458,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_chat_layout"):
             self._chat_layout.activate()
         bar = self._scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        QTimer.singleShot(0, lambda b=bar: b.setValue(b.maximum()))
 
     def _on_ai_chunk(self, row: MessageRow, chunk: str) -> None:
         """Обновляет строку ответа на каждый новый фрагмент стрима.

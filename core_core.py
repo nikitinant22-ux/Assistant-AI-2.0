@@ -103,6 +103,41 @@ def split_thinking(raw: str) -> tuple:
     return raw.strip(), "", False
 
 
+def extract_clean_verdict(raw: str) -> str:
+    """Жёсткая фильтрация (Пока-ёкэ): извлекает чистый вердикт Дипсика.
+
+    Из сырого накопленного текста Ведущего Архитектора возвращается ТОЛЬКО
+    финальное суждение — всё, что находится ПОСЛЕ последнего закрывающего
+    тега ``</thinking>``. Внутренние размышления ``<thinking>...</thinking>``
+    принудительно отсекаются и никогда не попадают на вход Помощника.
+
+    Аргументы:
+        raw: весь накопленный сырой вывод модели deepseek-r1.
+
+    Возвращает:
+        str — чистый вердикт ГИПа без тегов рассуждений (может быть пустым,
+              если модель выдала лишь мысли и не сформулировала суждения).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+
+    # 1. Есть закрытый блок рассуждений — берём строго то, что после него.
+    last_close = raw.rfind(_THINK_CLOSE)
+    if last_close != -1:
+        return raw[last_close + len(_THINK_CLOSE):].strip()
+
+    # 2. Закрытого тега нет, но есть открытый — модель ещё рассуждает.
+    #    Отсекаем всё, что внутри мыслей, оставляя лишь возможный текст
+    #    ДО открывающего тега (обычно пуст). Мистраль мысли не получит.
+    last_open = raw.rfind(_THINK_OPEN)
+    if last_open != -1:
+        return raw[:last_open].strip()
+
+    # 3. Тегов рассуждений нет вовсе — весь текст является вердиктом.
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # Бронированный сборщик NDJSON-строк (Канон Daman / Канон 14.3)
 # ---------------------------------------------------------------------------
@@ -434,13 +469,12 @@ class ChainedChatWorker(QThread):
             deepseek_raw = error
             self.thinking_changed.emit(error)
 
-        # Суждение Дипсика — видимый текст ВНЕ тегов рассуждений.
-        judgment, _th, _in = split_thinking(deepseek_raw)
-        if not judgment.strip():
-            # Запасной вариант: если модель не вывела чистого текста, берём весь
-            # сырой вывод, чтобы Помощнику было от чего оттолкнуться.
-            judgment = deepseek_raw.strip()
-        return judgment
+        # Жёсткая фильтрация (Пока-ёкэ): чистый вердикт — ТОЛЬКО текст ПОСЛЕ
+        # закрытого тега </thinking>. К этому моменту мысли Дипсика уже ушли
+        # в спойлер чата в реальном времени (см. цикл выше), поэтому здесь их
+        # можно безопасно отсечь. Внутренние размышления на вход Помощника
+        # НИКОГДА не попадают — никакого fallback на сырые теги нет.
+        return extract_clean_verdict(deepseek_raw)
 
     # ------------------------------------------------------------- основной ход
     def run(self) -> None:
@@ -453,9 +487,17 @@ class ChainedChatWorker(QThread):
         judgment = self._run_orchestrator()
 
         # Фаза 2: Помощник архитектора формулирует красивый финальный ответ.
+        # Бронированный Конвейерный Шаблон (Prompt Wrapper): чистый вердикт
+        # Дипсика связывается с исходным запросом инженера в строгой системной
+        # структуре, чтобы Мистраль не цитировал внутренние монологи, а выдал
+        # развёрнутый ответ градостроителя строго по директиве Ведущего ГИПа.
+        from main_router import build_mistral_input
+        mistral_user_content = build_mistral_input(judgment, self._prompt)
         payload = {
             "model": self._assistant_model,
-            "messages": self._build_messages(self._assistant_prompt, judgment),
+            "messages": self._build_messages(
+                self._assistant_prompt, mistral_user_content
+            ),
             "stream": True,
             "options": {"num_ctx": self._num_ctx, "temperature": 0.7},
         }
