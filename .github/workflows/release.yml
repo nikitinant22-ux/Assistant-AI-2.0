@@ -1,4 +1,4 @@
-name: Auto Version and README Update
+name: Auto Version Bump
 
 on:
   push:
@@ -25,17 +25,16 @@ jobs:
       with:
         python-version: '3.11'
 
-    # 3. Скрипт автоматизации версий и README
+    # 3. Скрипт автоматизации версий
     - name: Run automation script
       run: |
         python -c "
         import re
-        from datetime import datetime
 
-        # 1. Авто-обновление версии в pyproject.toml (повышаем патч-версию, например 1.0.0 -> 1.0.1)
+        # Авто-обновление версии в pyproject.toml (повышаем патч-версию, например 1.0.0 -> 1.0.1)
         with open('pyproject.toml', 'r') as f:
             content = f.read()
-        
+
         version_match = re.search(r'version = \"(\d+)\.(\d+)\.(\d+)\"', content)
         if version_match:
             major, minor, patch = map(int, version_match.groups())
@@ -46,14 +45,7 @@ jobs:
                 f.write(content)
             print(f'New version calculated: {new_version}')
         else:
-            new_version = '1.0.0'
-
-        # 2. Авто-обновление README.md
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log_entry = f'\n- **Последнее изменение:** Версия {new_version} успешно обновлена пайплайном в {current_time} UTC.\n'
-        
-        with open('README.md', 'a') as f:
-            f.write(log_entry)
+            print('Version string not found in pyproject.toml, nothing to bump')
         "
 
     # 4. Сохраняем изменения и отправляем обратно на GitHub / SourceCraft
@@ -61,7 +53,12 @@ jobs:
       run: |
         git config --global user.name "SourceCraft Automation"
         git config --global user.email "automation@sourcecraft.dev"
-        
-        git add pyproject.toml README.md
-        git commit -m "chore: auto-bump version and update README [skip ci]"
+
+        git add pyproject.toml
+        # Если версию поднять не удалось, коммитить нечего — выходим без ошибки
+        if git diff --staged --quiet; then
+          echo "Нет изменений для коммита"
+          exit 0
+        fi
+        git commit -m "chore: auto-bump version [skip ci]"
         git push origin main
