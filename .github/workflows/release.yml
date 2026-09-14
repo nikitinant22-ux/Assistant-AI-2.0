@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main # Скрипт срабатывает, когда изменения попадают в ветку main
-    paths-ignore: # Страховка от зацикливания; со встроенным GITHUB_TOKEN не требуется, см. комментарий ниже
+    paths-ignore: # Игнорируем изменения, сделанные самим ботом, чтобы избежать бесконечного цикла
       - 'pyproject.toml'
       - 'README.md'
 
@@ -12,18 +12,12 @@ jobs:
   bump-and-docs:
     runs-on: ubuntu-latest
 
-    # Встроенному токену нужно право записи, иначе push в main не пройдёт
-    permissions:
-      contents: write
-
     steps:
     # 1. Скачиваем код репозитория
-    # Токен не указан намеренно: actions/checkout берёт встроенный GITHUB_TOKEN.
-    # Пуш от него не перезапускает workflow, поэтому paths-ignore выше и [skip ci]
-    # в сообщении коммита стали избыточны и оставлены только как страховка на
-    # случай возврата к персональному токену.
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.SOURCECRAFT_TOKEN }} # Используем ваш токен для полного доступа
 
     # 2. Настраиваем Python окружение
     - name: Set up Python
@@ -54,11 +48,11 @@ jobs:
             print('Version string not found in pyproject.toml, nothing to bump')
         "
 
-    # 4. Сохраняем изменения и отправляем обратно в main
+    # 4. Сохраняем изменения и отправляем обратно на GitHub / SourceCraft
     - name: Commit and Push changes
       run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config --global user.name "SourceCraft Automation"
+        git config --global user.email "automation@sourcecraft.dev"
 
         git add pyproject.toml
         # Если версию поднять не удалось, коммитить нечего — выходим без ошибки
