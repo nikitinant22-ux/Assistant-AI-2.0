@@ -1,405 +1,511 @@
 # -*- coding: utf-8 -*-
-"""core_core.py — Единый фундамент подключения к AutoCAD 2025/2026 через pyautocad.
+"""core_core.py — Единый фундамент связи GUI с локальной Ollama (Канон 8, 11.2).
 
-Данный модуль является общей точкой входа для всех ИИ-агентов (Чертёжник,
-Аналитик, Оператор). Он отвечает за:
+Данный модуль — единственный разрешённый канал обмена данными между графической
+оболочкой и локальным сервером Ollama. Он реализует:
 
-    1. Безопасное подключение к уже запущенному экземпляру AutoCAD через
-       стабильную оболочку pyautocad (главный класс Autocad). Ключ
-       `create_if_not_exists=False` гарантирует, что мы перехватываем только
-       открытое окно САПР и никогда не создаём новый процесс.
-    2. Конвертацию координат в нативный класс точек pyautocad — APoint.
-       Это единственный безопасный способ передачи геометрии в ActiveX.
-    3. Вывод текстовых уведомлений робота в командную строку чертежа и
-       принудительную регенерацию графического экрана (doc.Regen(1)).
+    1. Класс фонового потока ``OllamaWorker(QThread)`` — изолирует все сетевые
+       запросы к Ollama от главного потока интерфейса. Прямые обращения к
+       http://localhost:11434 из UI категорически запрещены, чтобы окно
+       приложения не зависало ни на миллисекунду.
+    2. Потоковый (Streaming) вывод текста: каждый новый кусок ответа модели
+       немедленно уходит в GUI через сигнал ``chunk_received``.
+    3. Аккумуляцию и парсинг тегов рассуждений DeepSeek-R1 ``<thinking>...</thinking>``:
+       ход мыслей собирается отдельно и в конце передаётся вместе с очищенным
+       финальным ответом через сигнал ``generation_finished``.
 
-Вся работа с COM-объектами выполняется строго через API pyautocad:
-    - acad.app   -> Application
-    - acad.doc   -> ActiveDocument
-    - acad.model -> ModelSpace
+Поток принимает промпт пользователя, имя модели и текущий режим, а затем делает
+запрос к эндпоинту ``/api/chat`` с параметром ``"stream": True`` (NDJSON-поток).
 
-Внимание: внутри модуля НЕ используется exec()/eval() и НЕ используется сырой
-win32com.client — только статичные функции и стабильные методы pyautocad.
-Все комментарии и документация написаны строго на русском языке.
+Все комментарии и строки документации написаны строго на русском языке.
 """
 
 from __future__ import annotations
 
-# Главный класс связи pyautocad, нативный класс точки APoint и фабрика
-# одномерных double-массивов aDouble (для полилиний/массивов координат).
-from pyautocad import Autocad, APoint, aDouble
+import json          # разбор NDJSON-строк, поступающих из потокового ответа Ollama
+import re            # регулярные выражения для выделения блока <thinking>
+from typing import Iterable, Optional
+
+import requests      # HTTP-клиент: requests с stream=True для построчного чтения
+from PyQt6.QtCore import QThread, pyqtSignal
 
 
-# ---------------------------------------------------------------------------
-# ГЛОБАЛЬНЫЙ ОБЪЕКТ СВЯЗИ
-# ---------------------------------------------------------------------------
+# Базовый адрес локального API Ollama. Держим в одной константе, чтобы при
+# переносе проекта на другой хост менять URL в одном месте.
+OLLAMA_URL: str = "http://localhost:11434/api/chat"
 
-# Единственный глобальный коннектор к запущенному окну AutoCAD. Ключ
-# `create_if_not_exists=False` означает: мы подключаемся ТОЛЬКО к уже открытому
-# экземпляру САПР и не порождаем новый процесс. Подключение выполняется лениво
-# при первом обращении к свойствам acad.app / acad.doc / acad.model.
-acad = Autocad(create_if_not_exists=False)
+# Модели, задействованные на этом этапе. deepseek-r1:14b — генератор диалога
+# (умеет выдавать ход мыслей в тегах <thinking>), mistral-small:22b — инженерный
+# справочник, считывающий cad_reference.md.
+MODEL_DEEPSEEK: str = "deepseek-r1:14b"
+MODEL_MISTRAL: str = "mistral-small:22b"
 
-# Переменные-акцессоры для обратной совместимости с прежними импортами
-# (`from core_core import acad_app, doc, model_space`). Заполняются лениво через
-# get_autocad_connection(). Это просто удобные синонимы ссылок на объекты.
-acad_app = None      # Объект Application (pyautocad -> acad.app)
-doc = None           # Активный документ (ActiveDocument -> acad.doc)
-model_space = None   # Пространство модели (ModelSpace -> acad.model)
-
-# Префикс всех сообщений робота, выводимых в командную строку AutoCAD.
-AI_PREFIX = "[AI-Ассистент]: "
-
-# Текст понятной пользователю ошибки при невозможности подключиться к САПР.
-CONNECTION_ERROR_MESSAGE = (
-    "Убедитесь, что AutoCAD запущен и командная строка свободна."
+# Понятное пользователю сообщение о сбое связи с Ollama (на русском языке).
+OLLAMA_ERROR_MESSAGE: str = (
+    "Локальная модель Ollama не отвечает. Убедитесь, что она запущена."
 )
 
 
-def get_acad() -> Autocad:
-    """Возвращает глобальный объект связи pyautocad (Autocad).
-
-    Эта функция — единая точка доступа агентов к инстансу Autocad. Агенты
-    используют её, чтобы получить acad.app / acad.doc / acad.model одной
-    строкой без прямого обращения к глобальной переменной.
-
-    Возвращает:
-        Autocad — объект-обёртку pyautocad над активной сессией AutoCAD.
-    """
-    global acad
-    return acad
-
-
 # ---------------------------------------------------------------------------
-# Утилиты конвертации типов (защита от «багов типов» в AutoCAD ActiveX)
+# Парсинг тегов рассуждений <thinking>...</thinking>
 # ---------------------------------------------------------------------------
 
-def _as_float(value, default: float = 0.0) -> float:
-    """Приводит произвольное значение к float; при неудаче возвращает default.
+# Регулярное выражение закрытого блока рассуждений (без учёта регистра, с
+# допуском пробелов вокруг имени тега и DOTALL для многострочного содержимого).
+_THINK_BLOCK_RE = re.compile(r"<\s*thinking\s*>(.*?)<\s*/\s*thinking\s*>",
+                             re.IGNORECASE | re.DOTALL)
+# Имена открывающего и закрывающего тегов как литеральные подстроки.
+_THINK_OPEN = "<thinking>"
+_THINK_CLOSE = "</thinking>"
+
+
+def split_thinking(raw: str) -> tuple:
+    """Разделяет сырой поток LLM на три компонента.
+
+    Работает на «лету» во время стриминга: вызывается на каждом вновь
+    накопленном фрагменте текста и возвращает актуальное состояние разбора.
 
     Аргументы:
-        value: входное значение (число, строка, буква, None и т.п.).
-        default: значение по умолчанию (по умолчанию 0.0).
+        raw: весь накопленный на данный момент сырой текст ответа модели.
 
     Возвращает:
-        float — число либо значение default, если конвертация невозможна.
+        tuple (answer, thinking, in_thinking):
+            answer     — видимый текст ВНЕ тегов рассуждений;
+            thinking   — содержимое блоков <thinking>...</thinking> (без тегов);
+            in_thinking— True, если последний открытый тег ещё не закрыт
+                         (модель прямо сейчас рассуждает, ответа ещё нет).
     """
-    try:
-        return float(value)
-    except Exception:
-        return default
+    raw = raw or ""
 
-
-def to_cad_point(x, y, z=0.0) -> APoint:
-    """Принудительно приводит координаты к float и возвращает APoint.
-
-    Функция является ЕДИНСТВЕННЫМ разрешённым способом упаковки координат для
-    методов черчения и анализа AutoCAD. Любые входные данные (числа, строки,
-    буквы-маркеры 'x'/'y', пустые значения) приводятся к float, а непереводимые
-    компоненты безопасно заменяются на 0.0.
-
-    Аргументы:
-        x: координата по оси X.
-        y: координата по оси Y.
-        z: координата по оси Z (по умолчанию 0.0 — большинство задач в 2D).
-
-    Возвращает:
-        APoint — нативный класс точки pyautocad (подкласс array.array('d')).
-
-    Пример:
-        >>> to_cad_point("x", 20)  # вместо буквы подставится 0.0 -> APoint(0, 20, 0)
-    """
-    return APoint(_as_float(x), _as_float(y), _as_float(z))
-
-
-def to_cad_lwpolyline_points(points_list):
-    """Преобразует список координат в плоский double-массив для полилиний.
-
-    Используется строго для метода AddLightWeightPolyline. Принимает либо плоский
-    список чисел (X1, Y1, X2, Y2, ...), либо список пар [[x1, y1], ...]. Каждое
-    значение приводится к float, а непереводимые элементы заменяются на 0.0.
-
-    Аргументы:
-        points_list: плоский список координат либо список пар/кортежей точек.
-
-    Возвращает:
-        array.array('d') — плоский double-массив координат 2D (через aDouble).
-    """
-    flat_points = []
-    for item in points_list:
-        if isinstance(item, (list, tuple)):
-            # Точка задана парой/кортежем — разворачиваем её координаты.
-            for coord in item:
-                flat_points.append(_as_float(coord))
-        else:
-            # Одиночное число в плоском списке.
-            flat_points.append(_as_float(item))
-    return aDouble(flat_points)
-
-
-def to_cad_3d_array(points_list):
-    """Собирает массив координат 3D и упаковывает его в double-массив.
-
-    Используется для тяжёлых 3D-полилиний и массивов точек (Add3DPoly, AddLeader),
-    которые принимают строго три координаты на точку (X, Y, Z). Принимает как
-    плоский список чисел, так и список точек. Мусор заменяется на 0.0.
-
-    Аргументы:
-        points_list: плоский список чисел или список точек [[x,y,z], ...].
-
-    Возвращает:
-        array.array('d') — плоский double-массив (кратен трём).
-    """
-    flat = []
-
-    # Случай плоского списка чисел: считаем, что это последовательность XYZ.
-    if points_list and not isinstance(points_list[0], (list, tuple)):
-        raw = list(points_list)
-        # Добиваем длину до кратности трём, чтобы каждая точка была полной (XYZ).
-        while len(raw) % 3 != 0:
-            raw.append(0.0)
-        for value in raw:
-            flat.append(_as_float(value))
-        return aDouble(flat)
-
-    # Случай списка точек: берём ровно три координаты (X, Y, Z) на каждую.
-    for item in points_list:
-        coords = list(item) if isinstance(item, (list, tuple)) else [item]
-        # Добиваем (или обрезаем) до трёх координат.
-        coords = coords[:3] + [0.0] * (3 - len(coords))
-        for i in range(3):
-            flat.append(_as_float(coords[i]))
-
-    return aDouble(flat)
-
-
-# ---------------------------------------------------------------------------
-# Подключение к AutoCAD
-# ---------------------------------------------------------------------------
-
-def ensure_connection():
-    """Проверяет «пульс» COM-сессии и при обрыве пересоздаёт мост pyautocad.
-
-    Считывает лёгкое свойство acad.doc.Name. Если COM-сессия оборвана
-    (например, код -2147220995 'Объект не подключен к серверу'), мост pyautocad
-    пересоздаётся на лету через Autocad(create_if_not_exists=False). Если же
-    AutoCAD физически закрыт и пересоздать мост невозможно — возвращается False.
-
-    Функция принудительно вызывается в начале абсолютно каждого действия агентов
-    (перед черчением, анализом или регенерацией экрана), чтобы ни одна последующая
-    команда не упала из-за мёртвой сессии.
-
-    Возвращает:
-        bool — True, если связь жива или успешно восстановлена;
-               False, если AutoCAD недоступен.
-    """
-    global acad
-    # 1. Проверяем пульс уже существующего моста (если он ещё создан).
-    if acad is not None:
-        try:
-            # Лёгкое COM-обращение: читаем имя активного документа.
-            _ = acad.doc.Name
-            return True
-        except Exception:
-            # Сессия оборвана — ниже попробуем пересоздать мост на лету.
-            pass
-    # 2. Пересоздаём мост pyautocad и сразу проверяем его пульс.
-    try:
-        acad = Autocad(create_if_not_exists=False)
-        _ = acad.doc.Name
-        return True
-    except Exception:
-        # AutoCAD физически закрыт — восстанавливать нечего.
-        acad = None
-        return False
-
-
-def get_autocad_connection():
-    """Устанавливает и возвращает соединение с активным экземпляром AutoCAD.
-
-    Сначала проверяет «пульс» COM-сессии через ensure_connection() и при обрыве
-    автоматически восстанавливает мост pyautocad на лету. После успешной проверки
-    сохраняет ссылки на Application, ActiveDocument и ModelSpace в совместимые
-    глобальные переменные acad_app, doc, model_space и возвращает кортежем.
-
-    Возвращает:
-        tuple (acad_app, doc, model_space) — кортеж объектов при успехе.
-
-    Выбрасывает:
-        RuntimeError — если AutoCAD недоступен/физически закрыт.
-    """
-    global acad_app, doc, model_space
-    if not ensure_connection():
-        raise RuntimeError(CONNECTION_ERROR_MESSAGE)
-    acad_app = acad.app
-    doc = acad.doc
-    model_space = acad.model
-    return acad_app, doc, model_space
-
-
-# ---------------------------------------------------------------------------
-# Обратная связь и интерфейс
-# ---------------------------------------------------------------------------
-
-def send_cad_prompt(message: str) -> None:
-    """Выводит текстовое уведомление робота в командную строку AutoCAD.
-
-    Использует метод acad.prompt() из pyautocad, который печатает сообщение и в
-    консоль Python, и в командную строку AutoCAD (doc.Utility.Prompt). Сообщение
-    автоматически дополняется префиксом [AI-Ассистент]: .
-
-    Аргументы:
-        message: текст уведомления (строка).
-
-    Исключения не выбрасываются наружу: при сбое соединения сообщение выводится
-    в консоль Python, чтобы не нарушать работу других агентов.
-    """
-    try:
-        acad.prompt(f"{AI_PREFIX}{message}")
-    except Exception as exc:
-        print(f"{AI_PREFIX}Не удалось вывести сообщение в AutoCAD: {exc}")
-
-
-def update_screen() -> None:
-    """Принудительно регенерирует экран с автоматическим восстановлением сессии.
-
-    Сначала через ensure_connection() проверяет и, при необходимости, восстанавливает
-    COM-мост (пересоздаёт acad при обрыве -2147220995 'Объект не подключен к серверу'),
-    затем вызывает acad.doc.Regen(1) — полную перерисовку графического окна.
-
-    Исключения не выбрасываются наружу: при отсутствии соединения выполняет
-    «мягкое» игнорирование и записывает предупреждение в консоль Python.
-    """
-    try:
-        # Проверяем и восстанавливаем пульс COM-сессии до регенерации экрана.
-        if not ensure_connection():
-            print("[core_core] Автообновление экрана пропущено: нет соединения с AutoCAD.")
-            return
-        acad.doc.Regen(1)
-    except Exception as exc:
-        print(f"[core_core] Не удалось обновить экран AutoCAD: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Математические утилиты (расчёт расстояний, векторов и геометрии)
-# ---------------------------------------------------------------------------
-
-def object_center(obj) -> tuple:
-    """Возвращает центр ограничивающей рамки объекта (кортеж XYZ).
-
-    Используется как базовая точка для поворота, масштаба или перемещения
-    объектов. Координаты приводятся к float и усредняются по осям.
-
-    Аргументы:
-        obj: COM-объект AutoCAD, поддерживающий метод GetBoundingBox().
-
-    Возвращает:
-        tuple (cx, cy, cz) — центр рамки; при сбое возвращает (0.0, 0.0, 0.0).
-    """
-    try:
-        mn, mx = obj.GetBoundingBox()
-        return (
-            (float(mn[0]) + float(mx[0])) / 2.0,
-            (float(mn[1]) + float(mx[1])) / 2.0,
-            (float(mn[2]) + float(mx[2])) / 2.0,
+    # 1. Есть закрытый блок рассуждений — всё, что после него, это ответ.
+    last_close = raw.rfind(_THINK_CLOSE)
+    if last_close != -1:
+        tail = raw[last_close + len(_THINK_CLOSE):]
+        thinking = "\n".join(
+            m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(raw)
         )
-    except Exception as e:
-        # Выводим причину сбоя в консоль, а не молча проглатываем ошибку.
-        print(f" Критическая ошибка в core_core: {e}")
-        return (0.0, 0.0, 0.0)
+        return tail.strip(), thinking.strip(), False
+
+    # 2. Закрытых блоков нет, но есть открытый тег — модель рассуждает сейчас.
+    last_open = raw.rfind(_THINK_OPEN)
+    if last_open != -1:
+        thinking = "\n".join(
+            m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(raw)
+        )
+        # Незакрытый «хвост» рассуждений добавляем к общему блоку мыслей.
+        tail_think = raw[last_open + len(_THINK_OPEN):].strip()
+        if tail_think:
+            thinking = ((thinking + "\n" + tail_think).strip()
+                        if thinking else tail_think)
+        return "", thinking, True
+
+    # 3. Тегов рассуждений нет вовсе — весь текст является ответом.
+    return raw.strip(), "", False
 
 
-# Короткий псевдоним для обратной совместимости с прежним именем из cad_tools.
-_object_center = object_center
+# ---------------------------------------------------------------------------
+# Бронированный сборщик NDJSON-строк (Канон Daman / Канон 14.3)
+# ---------------------------------------------------------------------------
+
+# Байт переноса строки — разделитель NDJSON-объектов в потоке Ollama.
+_LINE_SEP = b"\n"
 
 
-def distance_2d(p1, p2) -> float:
-    """Вычисляет евклидово расстояние между двумя точками на плоскости XY.
+def iter_response_lines(response) -> Iterable[str]:
+    """Построчно отдаёт декодированные NDJSON-строки из потокового ответа.
 
-    Принимает координаты любого числового типа, приводит их к float и
-    возвращает длину отрезка между точками.
-
-    Аргументы:
-        p1: точка (x, y) или (x, y, z) — первая координата.
-        p2: точка (x, y) или (x, y, z) — вторая координата.
-
-    Возвращает:
-        float — расстояние между точками.
-    """
-    dx = float(p1[0]) - float(p2[0])
-    dy = float(p1[1]) - float(p2[1])
-    return (dx * dx + dy * dy) ** 0.5
-
-
-def distance_3d(p1, p2) -> float:
-    """Вычисляет евклидово расстояние между двумя точками в пространстве XYZ.
-
-    Аргументы:
-        p1: точка (x, y, z) — первая координата.
-        p2: точка (x, y, z) — вторая координата.
-
-    Возвращает:
-        float — трёхмерное расстояние между точками.
-    """
-    dx = float(p1[0]) - float(p2[0])
-    dy = float(p1[1]) - float(p2[1])
-    dz = float(p1[2]) if len(p1) > 2 else 0.0
-    dz -= float(p2[2]) if len(p2) > 2 else 0.0
-    return (dx * dx + dy * dy + dz * dz) ** 0.5
-
-
-def vector_between(p1, p2) -> tuple:
-    """Строит вектор направления из точки p1 в точку p2.
+    Бронированный сборщик, исключающий обрыв ответа на полуслове конструкцией,
+    а не инструкцией быть внимательным (Канон 14.3). Накопленные сырые байты
+    разбиваются ТОЛЬКО по символу переноса строки. Если чанк пришёл разорванным
+    пополам — например, TCP-сегмент разрезал JSON-объект или многобайтовый символ
+    UTF-8 — строка склеивается целиком в буфере и декодируется лишь после того,
+    как станет полной. Так служебные \n и \r на концах строк больше не теряются,
+    а незавершённый хвост без финального переноса тоже попадает в вывод.
 
     Аргументы:
-        p1: начальная точка (x, y, z).
-        p2: конечная точка (x, y, z).
+        response: объект потокового ответа requests (с включённым stream=True).
 
     Возвращает:
-        tuple (vx, vy, vz) — компоненты вектора, приведённые к float.
+        Итератор декодированных строк NDJSON (без пустых разделителей).
     """
-    return (
-        float(p2[0]) - float(p1[0]),
-        float(p2[1]) - float(p1[1]),
-        (float(p2[2]) if len(p2) > 2 else 0.0) - (float(p1[2]) if len(p1) > 2 else 0.0),
-    )
+    buffer = b""
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue  # пустой кусок ничего не даёт — пропускаем
+        buffer += chunk
+        while _LINE_SEP in buffer:
+            line, buffer = buffer.split(_LINE_SEP, 1)
+            line = line.strip()
+            if line:
+                yield line.decode("utf-8", errors="replace")
+    tail = buffer.strip()
+    if tail:
+        yield tail.decode("utf-8", errors="replace")
 
 
-def line_intersection(line1, line2):
-    """Вычисляет точку пересечения двух отрезков на плоскости XY.
+def parse_line(line: str) -> Optional[dict]:
+    """Разбирает одну NDJSON-строку в словарь.
 
-    Реализует классический алгоритм нахождения пересечения отрезков через
-    определители (детерминанты). Возвращает координаты пересечения только в том
-    случае, если точка действительно лежит на обоих отрезках (с допуском 0.01).
+    Если строка оказалась повреждённой или служебной (не JSON), возвращает None,
+    чтобы вызывающий код мог безопасно пропустить её, не прерывая поток.
 
     Аргументы:
-        line1: пара точек ((x1, y1), (x2, y2)) — первый отрезок.
-        line2: пара точек ((x1, y1), (x2, y2)) — второй отрезок.
+        line: одна строка NDJSON.
 
     Возвращает:
-        tuple (x, y) — координаты пересечения, либо None, если отрезки
-        не пересекаются или являются параллельными (div == 0).
+        dict | None — распознанный объект, либо None при невозможности разбора.
     """
-    xdiff = (line1[0][0] - line1[1][0], line2[0][0] - line2[1][0])
-    ydiff = (line1[0][1] - line1[1][1], line2[0][1] - line2[1][1])
-
-    def det(a, b):
-        # Определитель 2x2 матрицы, составленной из векторов a и b.
-        return a[0] * b[1] - a[1] * b[0]
-
-    div = det(xdiff, ydiff)
-    if div == 0:
+    try:
+        return json.loads(line)
+    except ValueError:
         return None
 
-    d = (det(*line1), det(*line2))
-    x = det(d, xdiff) / div
-    y = det(d, ydiff) / div
 
-    def is_on_segment(p, s1, s2):
-        # Проверка принадлежности точки p отрезку [s1, s2] с небольшим допуском.
-        return min(s1[0], s2[0]) - 0.01 <= p <= max(s1[0], s2[0]) + 0.01
+# ---------------------------------------------------------------------------
+# Фоновый поток стриминга Ollama
+# ---------------------------------------------------------------------------
 
-    if (is_on_segment(x, line1[0], line1[1]) and is_on_segment(x, line2[0], line2[1]) and
-            is_on_segment(y, line1[0], line1[1]) and is_on_segment(y, line2[0], line2[1])):
-        return x, y
-    return None
+class OllamaWorker(QThread):
+    """Фоновый поток, выполняющий потоковый запрос к локальной Ollama.
+
+    Никакие сетевые операции не выполняются в главном потоке GUI. Работник
+    принимает промпт, имя модели, режим и (опционально) системный промпт,
+    а затем в методе ``run()`` стримит ответ модели в интерфейс.
+
+    Сигналы:
+        chunk_received(str):     каждый новый фрагмент сырого текста модели
+                                 в реальном времени (передаётся как есть).
+        generation_finished(str, str): кортеж (финальный_ответ, блок_мыслей),
+                                 отправляется по завершении генерации.
+    """
+
+    chunk_received = pyqtSignal(str)
+    generation_finished = pyqtSignal(str, str)
+
+    def __init__(
+        self,
+        prompt: str,
+        model: str = MODEL_DEEPSEEK,
+        mode: str = "chat",
+        system_prompt: Optional[str] = None,
+        num_ctx: int = 16384,
+        parent=None,
+    ) -> None:
+        """Инициализирует фоновый работник стриминга.
+
+        Аргументы:
+            prompt: текст запроса пользователя.
+            model: имя модели Ollama (по умолчанию deepseek-r1:14b).
+            mode: текущий режим интерфейса ('chat' | 'assistant' | 'sandbox').
+            system_prompt: системный промпт модели (или None для дефолтного).
+            num_ctx: размер контекстного окна в токенах. Без явной установки Ollama
+                часто берёт по умолчанию 2048, чего не хватает при длинном
+                системном промпте — модель обрывает ответ через пару строк.
+            parent: родительский QObject для корректного времени жизни.
+        """
+        super().__init__(parent)
+        self._prompt = (prompt or "").strip()
+        self._model = model
+        self._mode = mode
+        self._system_prompt = system_prompt
+        self._num_ctx = num_ctx
+        self._raw: str = ""
+
+    # ------------------------------------------------------- сборка сообщений
+    def _build_messages(self) -> list:
+        """Собирает список сообщений chat-формата для запроса к Ollama.
+
+        Возвращает:
+            list — список словарей вида {"role": ..., "content": ...}.
+        """
+        messages = []
+        if self._system_prompt:
+            messages.append({"role": "system", "content": self._system_prompt})
+        messages.append({"role": "user", "content": self._prompt})
+        return messages
+
+    # ------------------------------------------------------------- основной ход
+    def run(self) -> None:
+        """Выполняет потоковый запрос к Ollama в фоновом потоке.
+
+        Читает NDJSON-поток ответа построчно, каждый фрагмент контента
+        транслирует в GUI через сигнал ``chunk_received`` и накапливает в
+        ``self._raw``. По завершении (или при сбое связи) разбирает накопленный
+        текст на ответ и мысли и отправляет их сигналом ``generation_finished``.
+        """
+        payload = {
+            "model": self._model,
+            "messages": self._build_messages(),
+            "stream": True,
+            # Явно расширяем контекстное окно, иначе при большом системном
+            # промпте модель упирается в дефолтный num_ctx и обрывает ответ.
+            "options": {
+                "num_ctx": self._num_ctx,
+                "temperature": 0.7,
+            },
+        }
+        try:
+            # timeout=(connect, read): соединение ждём до 30 с, чтение потока — 90 с
+            # (увеличенное время ожидания ответа модели, Канон Daman).
+            with requests.post(
+                OLLAMA_URL, json=payload, stream=True, timeout=(30, 90)
+            ) as resp:
+                resp.raise_for_status()
+                # Бронированный сборщик: склеивает разорванные NDJSON-строки,
+                # а повреждённые строки пропускает, не прерывая поток.
+                for line in iter_response_lines(resp):
+                    data = parse_line(line)
+                    if not data:
+                        continue  # битая/служебная строка — пропускаем
+                    delta = data.get("message", {}).get("content", "")
+                    if delta:
+                        self._raw += delta
+                        self.chunk_received.emit(delta)
+                    if data.get("done", False):
+                        break  # модель закончила генерацию
+        except requests.RequestException as exc:
+            # Сеть недоступна или Ollama выключена — сообщаем пользователю.
+            error = f"{OLLAMA_ERROR_MESSAGE}\n({exc})"
+            self._raw += error
+            self.chunk_received.emit(error)
+        except Exception as exc:
+            # Любая прочая ошибка тоже должна дойти до интерфейса.
+            error = f"Ошибка генерации: {exc}"
+            self._raw += error
+            self.chunk_received.emit(error)
+
+        # Разбираем накопленный текст: финальный ответ + отдельный блок мыслей.
+        answer, thinking, _in = split_thinking(self._raw)
+        self.generation_finished.emit(answer, thinking)
+
+
+# ---------------------------------------------------------------------------
+# Двухфазный многомодельный конвейер режима «Чат» (Канон 16.5)
+# ---------------------------------------------------------------------------
+
+
+class ChainedChatWorker(QThread):
+    """Сквозная оркестрация режима «Чат»: DeepSeek-R1 -> Mistral-Small.
+
+    Фаза 1 — Ведущий Архитектор-Градостроитель (deepseek-r1:14b): принимает
+    запрос инженера и системный промпт оркестрации, рассуждает на русском в
+    тегах <thinking> и выдаёт сжатое, очищенное суждение.
+
+    Фаза 2 — Помощник архитектора (mistral-small:22b): получает очищенное
+    суждение Дипсика вместе со своим системным промптом и формулирует финальный
+    красивый ответ строго на русском языке.
+
+    Такой конвейер гарантирует 100% фикс русского языка и единую профессиональную
+    ДНК софта: размышления прячутся в спойлер, а видимый текст генерирует Мистраль.
+
+    Сигналы:
+        chunk_received(str):    фрагмент ФИНАЛЬНОГО ответа Мистрали (реальный
+                                онлайн-стрим видимого текста).
+        thinking_changed(str):  актуальный блок рассуждений Дипсика — обновляет
+                                раскрывающийся спойлер мыслей в реальном времени.
+        generation_finished(str, str): кортеж (финальный_ответ, блок_мыслей) —
+                                вызывается по завершении обеих фаз.
+    """
+
+    chunk_received = pyqtSignal(str)
+    thinking_changed = pyqtSignal(str)
+    generation_finished = pyqtSignal(str, str)
+
+    def __init__(
+        self,
+        prompt: str,
+        orchestrator_model: str = MODEL_DEEPSEEK,
+        orchestrator_prompt: Optional[str] = None,
+        assistant_model: str = MODEL_MISTRAL,
+        assistant_prompt: Optional[str] = None,
+        mode: str = "chat",
+        num_ctx: int = 16384,
+        parent=None,
+    ) -> None:
+        """Инициализирует конвейер «Чат» из двух последовательных вызовов Ollama.
+
+        Аргументы:
+            prompt: текст запроса пользователя (для Ведущего Архитектора).
+            orchestrator_model: модель Диспетчера (по умолчанию deepseek-r1:14b).
+            orchestrator_prompt: системный промпт оркестрации Ведущего Архитектора.
+            assistant_model: модель Помощника (по умолчанию mistral-small:22b).
+            assistant_prompt: системный промпт Помощника архитектора.
+            mode: текущий режим интерфейса ('chat').
+            num_ctx: размер контекстного окна в токенах для обеих моделей.
+            parent: родительский QObject для корректного времени жизни.
+        """
+        super().__init__(parent)
+        self._prompt = (prompt or "").strip()
+        self._orchestrator_model = orchestrator_model
+        self._orchestrator_prompt = orchestrator_prompt
+        self._assistant_model = assistant_model
+        self._assistant_prompt = assistant_prompt
+        self._mode = mode
+        self._num_ctx = num_ctx
+        self._thinking: str = ""   # накопленный блок рассуждений Дипсика
+
+    # ------------------------------------------------------- сборка сообщений
+    @staticmethod
+    def _build_messages(system_prompt: Optional[str], user_content: str) -> list:
+        """Собирает сообщения chat-формата для запроса к Ollama.
+
+        Аргументы:
+            system_prompt: системный промпт модели (или None).
+            user_content: текст роли пользователя.
+
+        Возвращает:
+            list — список словарей вида {"role": ..., "content": ...}.
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
+    # ----------------------------------------------------------- фаза 1: Дипсик
+    def _run_orchestrator(self) -> str:
+        """Выполняет запрос к DeepSeek и возвращает ОЧИЩЕННОЕ суждение.
+
+        Поток рассуждений <thinking> транслируется сигналом ``thinking_changed``
+        (для спойлера), а видимый текст вне тегов становится суждением, которое
+        уйдёт Помощнику. При сбое сети возвращает текст ошибки на русском.
+
+        Возвращает:
+            str — очищенное суждение Ведущего Архитектора либо сообщение об ошибке.
+        """
+        payload = {
+            "model": self._orchestrator_model,
+            "messages": self._build_messages(self._orchestrator_prompt, self._prompt),
+            "stream": True,
+            "options": {"num_ctx": self._num_ctx, "temperature": 0.7},
+        }
+        deepseek_raw = ""
+        try:
+            # timeout=(connect, read): ждём соединение до 30 с, чтение потока — 90 с.
+            with requests.post(
+                OLLAMA_URL, json=payload, stream=True, timeout=(30, 90)
+            ) as resp:
+                resp.raise_for_status()
+                # Бронированный сборщик NDJSON-строк (склейка разорванных чанков).
+                for line in iter_response_lines(resp):
+                    data = parse_line(line)
+                    if not data:
+                        continue  # битая/служебная строка — пропускаем
+                    msg = data.get("message", {}) or {}
+                    delta = msg.get("content") or ""
+                    # Сборки deepseek-r1 отдают рассуждения в РАЗНЫХ полях:
+                    # "thinking" (текущая сборка Ollama), "reasoning_content",
+                    # либо тегами <thinking> внутри "content". Учитываем все.
+                    field_thinking = (
+                        msg.get("thinking")
+                        or msg.get("reasoning_content")
+                        or ""
+                    )
+                    if field_thinking:
+                        # Поле может приходить КУМУЛЯТИВНО (весь текст каждый раз)
+                        # либо ИНКРЕМЕНТАЛЬНО (каждый чанк — новый фрагмент).
+                        # Обрабатываем оба варианта конструкцией:
+                        #   - если новый текст начинается с уже собранного — он
+                        #     кумулятивный, просто наращиваем до нового значения;
+                        #   - иначе — это новый фрагмент, дописываем его в хвост.
+                        if self._thinking and field_thinking.startswith(
+                                self._thinking):
+                            self._thinking = field_thinking
+                        else:
+                            self._thinking += field_thinking
+                        self.thinking_changed.emit(self._thinking)
+                    if delta:
+                        deepseek_raw += delta
+                        # Если рассуждения пришли тегами внутри content —
+                        # извлекаем их и показываем в спойлере.
+                        _ans, inline_thinking, _in = split_thinking(deepseek_raw)
+                        if inline_thinking and not field_thinking:
+                            if inline_thinking != self._thinking:
+                                self._thinking = inline_thinking
+                                self.thinking_changed.emit(self._thinking)
+                    if data.get("done", False):
+                        break
+        except requests.RequestException as exc:
+            error = f"{OLLAMA_ERROR_MESSAGE}\n({exc})"
+            deepseek_raw = error
+            self.thinking_changed.emit(error)
+        except Exception as exc:
+            error = f"Ошибка генерации: {exc}"
+            deepseek_raw = error
+            self.thinking_changed.emit(error)
+
+        # Суждение Дипсика — видимый текст ВНЕ тегов рассуждений.
+        judgment, _th, _in = split_thinking(deepseek_raw)
+        if not judgment.strip():
+            # Запасной вариант: если модель не вывела чистого текста, берём весь
+            # сырой вывод, чтобы Помощнику было от чего оттолкнуться.
+            judgment = deepseek_raw.strip()
+        return judgment
+
+    # ------------------------------------------------------------- основной ход
+    def run(self) -> None:
+        """Выполняет двухфазный конвейер «Чат» в фоновом потоке.
+
+        Сначала запрашивает DeepSeek (мысли уходят в спойлер), затем передаёт
+        очищенное суждение Мистрали и стримит финальный ответ в интерфейс.
+        """
+        # Фаза 1: Ведущий Архитектор рассуждает и формирует суждение.
+        judgment = self._run_orchestrator()
+
+        # Фаза 2: Помощник архитектора формулирует красивый финальный ответ.
+        payload = {
+            "model": self._assistant_model,
+            "messages": self._build_messages(self._assistant_prompt, judgment),
+            "stream": True,
+            "options": {"num_ctx": self._num_ctx, "temperature": 0.7},
+        }
+        mistral_raw = ""
+        try:
+            # timeout=(connect, read): соединение до 30 с, чтение потока — 90 с.
+            with requests.post(
+                OLLAMA_URL, json=payload, stream=True, timeout=(30, 90)
+            ) as resp:
+                resp.raise_for_status()
+                # Бронированный сборщик NDJSON-строк — финальное предложение
+                # дописывается до точки, а не обрывается на разорванном чанке.
+                for line in iter_response_lines(resp):
+                    data = parse_line(line)
+                    if not data:
+                        continue  # битая/служебная строка — пропускаем
+                    delta = data.get("message", {}).get("content", "")
+                    if delta:
+                        mistral_raw += delta
+                        self.chunk_received.emit(delta)
+                    if data.get("done", False):
+                        break
+        except requests.RequestException as exc:
+            error = f"{OLLAMA_ERROR_MESSAGE}\n({exc})"
+            mistral_raw = error
+            self.chunk_received.emit(error)
+        except Exception as exc:
+            error = f"Ошибка генерации: {exc}"
+            mistral_raw = error
+            self.chunk_received.emit(error)
+
+        # Финальный ответ Мистрали + блок мыслей Дипсика (для спойлера).
+        answer, _th, _in = split_thinking(mistral_raw)
+        self.generation_finished.emit(answer.strip(), self._thinking)
+
+
+# ---------------------------------------------------------------------------
+# Модульный уровень (удобно для ручных проверок без запуска GUI)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    # Быстрый самопроверочный тест парсинга тегов рассуждений.
+    sample = (
+        "<thinking>Проверяю намерение пользователя.</thinking>\n"
+        "Готов выполнить команду начертить линию."
+    )
+    _ans, _th, _in = split_thinking(sample)
+    print("Ответ:", _ans)
+    print("Мысли:", _th)
+    print("Внутри мыслей:", _in)
+    sys.exit(0)

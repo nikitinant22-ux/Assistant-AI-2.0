@@ -1,0 +1,916 @@
+# -*- coding: utf-8 -*-
+"""Парящий безрамочный интерфейс Fluent Design (Этап 1, чистый старт).
+
+Модуль реализует визуальный каркас «Бесшовного пространства» на PyQt6 +
+qfluentwidgets, полностью следуя дизайн-коду Windows 11 (Канон 4.2, 14.3, 16.5):
+
+    * Безрамочный холст чата, залитый сплошным матовым графитом #1e1e1e;
+    * Слева — узкая полоса управления и выдвижной «Инженерный хаб» с историей
+      чатов (анимация ширины через QPropertyAnimation от 0 до 220px);
+    * Сверху — капсульный SegmentedWidget переключения трёх режимов;
+    * По центру — welcome-экраны, «баблы» сообщений, сворачиваемый спойлер
+      «хода мыслей» и градиентное угасание текста над капсулой ввода;
+    * Внизу — парящая капсула ввода со встроенными кнопками (+) и (📷, ↑)
+      и миниатюрой контекста «Ножниц» с крестиком ✕ (пока-ёкэ).
+
+Вся стилистика вынесена в отдельный модуль cad_ui_styles. Здесь только чистая
+компоновка виджетов, а бизнес-логика (маршрутизация, ИИ) общается с UI через
+сигналы и чистые данные, не примешиваясь к слою графики (Канон 4.2).
+
+Комментарии и docstrings — строго на русском языке, идентификаторы — ASCII.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    Qt,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QGuiApplication, QPixmap
+from PyQt6.QtWidgets import (
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+    QRubberBand,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+from qfluentwidgets import (
+    FluentIcon,
+    IconWidget,
+    InfoBar,
+    InfoBarPosition,
+    SegmentedWidget,
+    SmoothScrollArea,
+    Theme,
+    ToolButton,
+    setTheme,
+)
+
+import cad_ui_styles as styles
+
+
+# =============================================================================
+# МЕЛКИЕ ВИЗУАЛЬНЫЕ ПРИМИТИВЫ (спойлер, баблы, welcome, оверлей, превью)
+# =============================================================================
+class ThinkingSpoiler(QWidget):
+    """Сворачиваемая «складочка» для скрытия тега <thinking>.
+
+    Заголовок «⌵ Посмотреть ход мыслей» при клике плавно раскрывает/сворачивает
+    тело с ходом рассуждений модели. По умолчанию тело скрыто, чтобы не
+    загромождать ленту чата (Канон дизайна — чистота полотна).
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        # Вертикальная компоновка: заголовок-кнопка + тело спойлера.
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 4, 0, 2)
+        self._layout.setSpacing(2)
+
+        self._toggle = QPushButton("⌵ Посмотреть ход мыслей", self)
+        self._toggle.setObjectName("thinkingToggle")
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(False)
+
+        self._body = QLabel("", self)
+        self._body.setObjectName("thinkingBody")
+        self._body.setWordWrap(True)
+        self._body.hide()
+
+        self._layout.addWidget(self._toggle)
+        self._layout.addWidget(self._body)
+
+        self._toggle.clicked.connect(self._on_toggle)
+
+    def _on_toggle(self, checked: bool) -> None:
+        """Показывает/скрывает тело спойлера по состоянию заголовка."""
+        self._body.setVisible(checked)
+        # Меняем подпись под состояние складочки.
+        self._toggle.setText("⌵ Свернуть ход мыслей" if checked else "⌵ Посмотреть ход мыслей")
+
+    def set_thinking(self, text: str) -> None:
+        """Задаёт текст хода мыслей и сбрасывает складку в закрытое состояние."""
+        self._body.setText(text)
+        self._toggle.setChecked(False)
+        self._on_toggle(False)
+
+
+class MessageRow(QWidget):
+    """Одна строка сообщения в ленте чата.
+
+    Сообщение пользователя — скруглённый «бабл» (#2d2d2d) у правого края,
+    ответ ИИ — свободное полотно без боксов слева. Опционально прикрепляется
+    спойлер «хода мыслей» для ответа ИИ.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(4, 4, 4, 4)
+        self._layout.setSpacing(8)
+
+        # Левая и правая «пружины» выравнивают сообщение к нужному краю.
+        self._left_stretch = QWidget(self)
+        self._right_stretch = QWidget(self)
+
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._spoiler: Optional[ThinkingSpoiler] = None
+
+        # Строка ответа ИИ размещается в вертикальной компоновке под спойлером.
+        self._ai_wrap = QWidget(self)
+        self._ai_layout = QVBoxLayout(self._ai_wrap)
+        self._ai_layout.setContentsMargins(0, 0, 0, 0)
+        self._ai_layout.setSpacing(2)
+        self._ai_layout.addWidget(self._label)
+
+    def show_user(self, text: str) -> None:
+        """Оформляет строку как «бабл» пользователя справа."""
+        self._clear()
+        self._label.setObjectName("userBubble")
+        self._label.setText(text)
+        self._label.setMaximumWidth(520)
+        # Пружина слева прижимает бабл к правому краю.
+        self._layout.addWidget(self._left_stretch, 1)
+        self._layout.addWidget(self._label, 0)
+        self._layout.addWidget(self._right_stretch, 0)
+        self._apply_style(self._label)
+
+    def show_ai(self, text: str, thinking: str = "") -> None:
+        """Оформляет строку как свободный ответ ИИ слева (без бокса)."""
+        self._clear()
+        self._label.setObjectName("aiAnswer")
+        self._label.setText(text)
+        self._label.setMaximumWidth(720)
+        # При наличии хода мыслей добавляем спойлер под ответом.
+        if thinking:
+            self._spoiler = ThinkingSpoiler(self)
+            self._spoiler.set_thinking(thinking)
+            self._ai_layout.addWidget(self._spoiler)
+        self._layout.addWidget(self._left_stretch, 0)
+        self._layout.addWidget(self._ai_wrap, 1)
+        self._layout.addWidget(self._right_stretch, 0)
+        self._apply_style(self._label)
+        if self._spoiler is not None:
+            self._apply_style(self._spoiler)
+
+    def set_streaming_text(self, text: str) -> None:
+        """Обновляет текст ответа ИИ в потоковом режиме (стриминг)."""
+        if self._label.objectName() == "aiAnswer":
+            self._label.setText(text)
+
+    def _clear(self) -> None:
+        """Очищает компоновку от предыдущего наполнения строки."""
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        while self._ai_layout.count():
+            item = self._ai_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self._spoiler = None
+
+    def _apply_style(self, widget: QWidget) -> None:
+        """Принудительно переприменяет стили к дочернему виджету."""
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+
+class WelcomeHost(QWidget):
+    """Отцентрированный welcome-экран конкретного режима.
+
+    Строго по центру бесшовного полотна отображается светло-серое приветствие
+    и приглушённые тёмно-серые примеры команд, уникальные для каждого режима.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("welcomeHost")
+
+        # Центрирование контента по горизонтали и вертикали.
+        outer = QVBoxLayout(self)
+        outer.addStretch(1)
+
+        inner = QVBoxLayout()
+        inner.setSpacing(6)
+        inner.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        self._title = QLabel("", self)
+        self._title.setObjectName("welcomeTitle")
+        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._subtitle = QLabel("", self)
+        self._subtitle.setObjectName("welcomeSubtitle")
+        self._subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._examples: list[QLabel] = []
+
+        inner.addWidget(self._title)
+        inner.addSpacing(8)
+        inner.addWidget(self._subtitle)
+        inner.addSpacing(16)
+        for _ in range(3):
+            example = QLabel("", self)
+            example.setObjectName("welcomeExample")
+            example.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._examples.append(example)
+            inner.addWidget(example)
+
+        outer.addLayout(inner)
+        outer.addStretch(1)
+
+    def set_mode(self, mode: str) -> None:
+        """Заполняет welcome-экран данными заданного режима из Манифеста."""
+        data = styles.WELCOME_SCREENS.get(mode, styles.WELCOME_SCREENS[styles.MODE_CHAT])
+        self._title.setText(data["title"])
+        self._subtitle.setText(data["subtitle"])
+        for example, examples in zip(self._examples, data["examples"]):
+            example.setText(examples)
+
+
+class HubDividerLine(QWidget):
+    """Горизонтальная черта, плавно угасающая по краям (Fade-out Gradient Line).
+
+    Отделяет неподвижные кнопки управления хаба от списка прошлых чатов.
+    Отрисовка делегируется функции cad_ui_styles.paint_hub_fade_line.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(2)
+        # Черта не перехватывает клики мыши.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """Рисует черту с угасанием краёв в градиент."""
+        from PyQt6.QtGui import QPainter
+
+        painter = QPainter(self)
+        styles.paint_hub_fade_line(self, painter)
+        painter.end()
+
+
+class FadeOutOverlay(QWidget):
+    """Прозрачный градиентный слой угасания чата над капсулой ввода.
+
+    Высота 40px, плавно переходит от абсолютно прозрачного сверху к 100%
+    плотному цвету фона окна снизу, чтобы текст растворялся, уходя за парящее
+    поле (пока-ёкэ от «ослепшего зрения»).
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(40)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """Рисует линейный градиент угасания снизу вверх."""
+        from PyQt6.QtGui import QPainter
+
+        painter = QPainter(self)
+        styles.paint_fade_out(self, painter, self.height())
+        painter.end()
+
+
+class ScreenshotPreview(QWidget):
+    """Миниатюра контекста «Ножниц» с крестиком ✕ (пока-ёкэ, Канон 14.3).
+
+    Скруглённый прямоугольник-превью всплывает прямо НАД парящей капсулой ввода.
+    На углу горит изящный крестик для удаления снимка из памяти — ошибка отправки
+    сырого изображения в ИИ исключена самой конструкцией интерфейса.
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("screenshotPreview")
+        self.setFixedHeight(76)
+        self.setMaximumWidth(320)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self._thumb = QLabel(self)
+        self._thumb.setFixedSize(120, 60)
+        self._thumb.setScaledContents(False)
+        self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._close_btn = ToolButton(FluentIcon.CLOSE, self)
+        self._close_btn.setFixedSize(26, 26)
+        self._close_btn.setToolTip("Удалить снимок из памяти")
+        self._close_btn.clicked.connect(self.closed)
+
+        layout.addWidget(self._thumb)
+        layout.addStretch(1)
+        layout.addWidget(self._close_btn)
+
+        self.hide()
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
+        """Показывает снимок, аккуратно вписанный в миниатюру."""
+        self._thumb.setPixmap(
+            pixmap.scaled(
+                self._thumb.width(),
+                self._thumb.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.show()
+
+
+class ScreenSnipperOverlay(QDialog):
+    """Полноэкранный прозрачный оверлей «Ножниц» на PyQt6.
+
+    Математика координат адаптирована из Архива (Archive/cad_vision.py): при
+    нажатии фиксируется стартовая точка, при движении обновляется рамка, а при
+    отпускании прямоугольник нормализуется через min/max (left, top, right,
+    bottom) и захватывается снимок экрана. Сама отрисовка рамки выполнена на
+    PyQt6 через QRubberBand.
+    """
+
+    captured = pyqtSignal(QPixmap, tuple)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        # Полноэкранное безрамочное поверхностное окно поверх всего экрана.
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setWindowOpacity(0.3)
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            geometry = screen.geometry()
+            self.setGeometry(geometry)
+        # Лёгкое затемнение всего экрана (мягкая маска 30%).
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 230);")
+
+        self._rubber: Optional[QRubberBand] = None
+        self._origin = QPoint()
+        self._bbox: Optional[Tuple[int, int, int, int]] = None
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """Фиксирует стартовую точку и создаёт резиновую рамку выделения."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._origin = event.position().toPoint()
+            if self._rubber is None:
+                self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+            self._rubber.setGeometry(
+                QRect(self._origin, self._origin).normalized()
+            )
+            self._rubber.show()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        """При движении мыши просто обновляет геометрию рамки."""
+        if self._rubber is not None:
+            current = event.position().toPoint()
+            self._rubber.setGeometry(QRect(self._origin, current).normalized())
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        """Нормализует прямоугольник, захватывает снимок и закрывает оверлей."""
+        if event.button() != Qt.MouseButton.LeftButton or self._rubber is None:
+            return
+        rect = self._rubber.geometry().normalized()
+        # Защита от случайного «клика» без растягивания рамки.
+        if rect.width() < 4 or rect.height() < 4:
+            self._cancel()
+            return
+
+        left, top = rect.left(), rect.top()
+        right, bottom = rect.right(), rect.bottom()
+        self._bbox = (left, top, right, bottom)
+
+        # Глобальные координаты области для захвата снимка с экрана.
+        global_rect = QRect(self.mapToGlobal(rect.topLeft()), rect.size())
+        screen = QGuiApplication.primaryScreen()
+        pixmap = QPixmap()
+        if screen is not None:
+            pixmap = screen.grabWindow(0, global_rect.x(), global_rect.y(),
+                                       global_rect.width(), global_rect.height())
+        self.accept()
+        if not pixmap.isNull():
+            self.captured.emit(pixmap, self._bbox)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """Отменяет выделение по клавише Esc."""
+        if event.key() == Qt.Key.Key_Escape:
+            self._cancel()
+
+    def _cancel(self) -> None:
+        """Закрывает оверлей без результата."""
+        self._bbox = None
+        self.reject()
+
+
+class InputCapsule(QFrame):
+    """Парящая капсула ввода со ВСТРОЕННЫМИ кнопками внутри текстовой рамки.
+
+    Поле ввода заполняет всю капсулу, а его внутренние отступы (padding-left /
+    padding-right, заданы в QSS) оставляют свободное место по краям. Поверх
+    этого места абсолютным позиционированием (метод move) размещаются кнопки:
+
+        * слева внутри рамки — синяя круглая кнопка «+»;
+        * справа внутри рамки (рядом друг с другом) — фотоаппарат 📷
+          и интенсивно-синяя круглая кнопка отправки с вертикальной ↑.
+
+    Позиции пересчитываются в resizeEvent, поэтому кнопки всегда сидят
+    ВНУТРИ капсулы независимо от ширины окна.
+    """
+
+    # Сигналы: запрос отправки текста, клик по «+», клик по фотоаппарату.
+    send_requested = pyqtSignal(str)
+    plus_clicked = pyqtSignal()
+    camera_clicked = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("inputCapsule")
+        self.setFixedHeight(52)
+
+        # Текстовое поле заполняет капсулу; отступы под кнопки — в QSS.
+        self.input = QPlainTextEdit(self)
+        self.input.setObjectName("messageInput")
+        self.input.setPlaceholderText("Введите сообщение…")
+        self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.input.textChanged.connect(self._update_send_state)
+
+        # Синяя круглая кнопка «+» на левом краю внутри капсулы.
+        self.plus_btn = QPushButton("+", self)
+        self.plus_btn.setObjectName("plusCircle")
+        self.plus_btn.setFixedSize(30, 30)
+        self.plus_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plus_btn.setToolTip("Добавить контекст")
+        self.plus_btn.clicked.connect(self.plus_clicked)
+
+        # Фотоаппарат 📷 — вызов «Ножниц» (стоит рядом с кнопкой отправки).
+        self.camera_btn = ToolButton(FluentIcon.CAMERA, self)
+        self.camera_btn.setFixedSize(32, 32)
+        self.camera_btn.setToolTip("Ножницы: выделить область экрана")
+        self.camera_btn.clicked.connect(self.camera_clicked)
+
+        # Круглая синяя кнопка отправки с вертикальной стрелочкой вверх ↑.
+        self.send_btn = QPushButton("↑", self)
+        self.send_btn.setObjectName("sendCircle")
+        self.send_btn.setFixedSize(36, 36)
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_btn.setToolTip("Отправить сообщение")
+        self.send_btn.setEnabled(False)
+        self.send_btn.clicked.connect(self._on_send_clicked)
+
+        # Серая подсветка фокуса капсулы при клике в текстовое поле.
+        self.input.focusInEvent = lambda e: self.set_focused(True)
+        self.input.focusOutEvent = lambda e: self.set_focused(False)
+
+        self._relayout()
+
+    def _on_send_clicked(self) -> None:
+        """Извлекает текст и шлёт сигнал отправки наружу."""
+        text = self.input.toPlainText().strip()
+        if text:
+            self.send_requested.emit(text)
+
+    def _update_send_state(self) -> None:
+        """Активирует кнопку отправки при наличии текста в поле."""
+        self.send_btn.setEnabled(bool(self.input.toPlainText().strip()))
+
+    def clear(self) -> None:
+        """Очищает текстовое поле капсулы."""
+        self.input.clear()
+
+    def set_focused(self, focused: bool) -> None:
+        """Подсвечивает капсулу серым акцентом при фокусе на поле (пока-ёкэ)."""
+        self.setProperty("focused", focused)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _relayout(self) -> None:
+        """Раскладывает поле и кнопки внутри капсулы (абсолютное позиционирование)."""
+        w, h = self.width(), self.height()
+        # Поле растягивается на всю капсулу; кнопки лежат поверх него.
+        self.input.setGeometry(0, 0, w, h)
+        # Левая кнопка «+».
+        self.plus_btn.move(8, (h - self.plus_btn.height()) // 2)
+        # Правая группа: кнопка отправки и фотоаппарат рядом друг с другом.
+        send_x = w - self.send_btn.width() - 8
+        camera_x = send_x - self.camera_btn.width() - 8
+        self.send_btn.move(send_x, (h - self.send_btn.height()) // 2)
+        self.camera_btn.move(camera_x, (h - self.camera_btn.height()) // 2)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """Пересчитывает позиции кнопок при изменении размера капсулы."""
+        super().resizeEvent(event)
+        self._relayout()
+
+
+# =============================================================================
+# ГЛАВНОЕ БЕЗРАМОЧНОЕ ОКНО (BORDERLESS CANVAS)
+# =============================================================================
+class MainWindow(QWidget):
+    """Парящее безрамочное окно «Бесшовного пространства».
+
+    Собирает единый матово-графитовый холст, левый «Инженерный хаб» с историей
+    чатов, верхний капсульный переключатель режимов, центральную ленту чата с
+    welcome-экранами и градиентным угасанием, а также парящую капсулу ввода со
+    встроенными кнопками и миниатюрой «Ножниц».
+    """
+
+    # Сигнал отправки сообщения из капсулы ввода.
+    send_requested = pyqtSignal(str)
+
+    DRAWER_MAX_WIDTH: int = 220
+    PADDING: int = 18
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        setTheme(Theme.DARK)  # Тёмная тема Fluent Design Windows 11.
+        self.setWindowTitle("CAD Инженерный Ассистент")
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self.setObjectName("mainCanvas")
+        self.setMinimumSize(600, 750)
+        self.resize(1024, 760)
+        self.setStyleSheet(styles.build_global_stylesheet())
+
+        # Состояние окна для перетаскивания безрамочного окна мышью.
+        self._drag_offset: Optional[QPoint] = None
+        self._mode: str = styles.MODE_CHAT
+
+        self._build_rail_and_drawer()
+        self._build_top_segment()
+        self._build_chat_area()
+        self._build_input_capsule()
+
+        # Объединяем всё в корневую горизонтальную компоновку.
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._control_rail)
+        root.addWidget(self._drawer, 0)
+        root.addWidget(self._canvas, 1)
+
+        self.set_mode(self._mode)
+
+    # -------------------------------------------------------------------------
+    # Левая полоса управления и выдвижной «Инженерный хаб»
+    # -------------------------------------------------------------------------
+    def _build_rail_and_drawer(self) -> None:
+        """Создаёт узкую полосу управления и выдвижную панель истории чатов."""
+        # --- Узкая вертикальная полоса управления (#141414) ---
+        self._control_rail = QWidget(self)
+        self._control_rail.setObjectName("controlRail")
+        self._control_rail.setFixedWidth(44)
+        rail_layout = QVBoxLayout(self._control_rail)
+        rail_layout.setContentsMargins(8, 12, 8, 12)
+        rail_layout.setSpacing(10)
+
+        # Кнопка «+» — создать новый чат (спрашивает разрешение на развёртывание).
+        self._new_chat_btn = IconWidget(FluentIcon.ADD, self._control_rail)
+        self._new_chat_btn.setFixedSize(28, 28)
+        self._new_chat_btn.setToolTip("Создать новый чат")
+        self._new_chat_btn.mousePressEvent = lambda e: self._notify_in_dev("Новый чат")
+
+        # Кнопка «История» — выдвигает/убирает хаб с анимацией ширины.
+        self._history_btn = IconWidget(FluentIcon.HISTORY, self._control_rail)
+        self._history_btn.setFixedSize(28, 28)
+        self._history_btn.setToolTip("История чатов")
+        self._history_btn.mousePressEvent = self._on_history_click
+
+        rail_layout.addWidget(self._new_chat_btn)
+        rail_layout.addWidget(self._history_btn)
+        rail_layout.addStretch(1)
+
+        # --- Выдвижной «Инженерный хаб» ---
+        self._drawer = QWidget(self)
+        self._drawer.setObjectName("drawerBody")
+        self._drawer.setFixedWidth(0)  # по умолчанию список чатов скрыт
+        self._drawer_visible = False
+
+        drawer_layout = QVBoxLayout(self._drawer)
+        drawer_layout.setContentsMargins(0, 10, 0, 8)
+        drawer_layout.setSpacing(6)
+
+        # Угасающая разделительная черта под кнопками управления.
+        self._hub_divider = HubDividerLine(self._drawer)
+        drawer_layout.addWidget(self._hub_divider)
+        drawer_layout.addSpacing(4)
+
+        # Плавная прокрутка списка прошлых чатов (SmoothScrollArea).
+        self._history_scroll = SmoothScrollArea(self._drawer)
+        self._history_scroll.setObjectName("historyScroll")
+        self._history_scroll.setWidgetResizable(True)
+        self._history_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._history_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        history_body = QWidget(self._history_scroll)
+        self._history_list = QVBoxLayout(history_body)
+        self._history_list.setContentsMargins(4, 4, 4, 4)
+        self._history_list.setSpacing(2)
+        self._history_list.addStretch(1)
+        self._history_scroll.setWidget(history_body)
+        drawer_layout.addWidget(self._history_scroll, 1)
+
+        # Демонстрационные записи истории (заглушки этапа 1).
+        for title in ["Чертёж фундамента", "Спецификация кабеля", "План освещения"]:
+            self._history_list.insertWidget(0, self._make_chat_item(title))
+
+        # Анимация выезжания/уезжания хаба за счёт изменения ширины.
+        self._drawer_anim = QPropertyAnimation(self._drawer, b"maximumWidth", self)
+        self._drawer_anim.setDuration(240)
+        self._drawer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def _make_chat_item(self, title: str) -> QWidget:
+        """Создаёт запись прошлого чата с микро-иконкой корзины при Hover."""
+        item = QFrame(self._history_scroll)
+        item.setObjectName("chatItem")
+        item.setFixedHeight(40)
+        lay = QHBoxLayout(item)
+        lay.setContentsMargins(10, 0, 6, 0)
+        lay.setSpacing(6)
+
+        label = QLabel(title, item)
+        label.setStyleSheet("background: transparent; color: %s;" % styles.Palette.TEXT_DIM)
+        lay.addWidget(label, 1)
+
+        # Микро-иконка корзины, видимая только при наведении на элемент.
+        trash = IconWidget(FluentIcon.DELETE, item)
+        trash.setFixedSize(18, 18)
+        trash.setToolTip("Удалить чат")
+        trash.hide()
+        item.enterEvent = lambda e, t=trash: t.show()
+        item.leaveEvent = lambda e, t=trash: t.hide()
+        lay.addWidget(trash)
+        return item
+
+    def _on_history_click(self, event) -> None:
+        """Переключает видимость выдвижного хаба плавной анимацией ширины."""
+        self._drawer_visible = not self._drawer_visible
+        target = self.DRAWER_MAX_WIDTH if self._drawer_visible else 0
+        self._drawer_anim.stop()
+        self._drawer_anim.setStartValue(self._drawer.width())
+        self._drawer_anim.setEndValue(target)
+        self._drawer_anim.start()
+
+    # -------------------------------------------------------------------------
+    # Верхний капсульный переключатель трёх режимов
+    # -------------------------------------------------------------------------
+    def _build_top_segment(self) -> None:
+        """Создаёт верхнюю панель с капсульным сегментом и системными кнопками."""
+        # Капсульный переключатель трёх режимов (активный — синий акцент).
+        self._segment = SegmentedWidget(self)
+        for mode, label in styles.MODE_LABELS.items():
+            self._segment.addItem(routeKey=mode, text=label)
+        self._segment.currentItemChanged.connect(self._on_mode_changed)
+
+        # Системные кнопки окна (Свернуть / Развернуть / Закрыть) справа сверху.
+        # Иконки: MINIMIZE — свернуть, ZOOM_IN — развернуть (аналог MAXIMIZE,
+        # которого нет в библиотеке), CLOSE — закрыть.
+        self._win_min = self._make_win_button(FluentIcon.MINIMIZE, "winBtn")
+        self._win_max = self._make_win_button(FluentIcon.ZOOM_IN, "winBtn")
+        self._win_close = self._make_win_button(FluentIcon.CLOSE, "winClose")
+
+        self._win_min.clicked.connect(self.showMinimized)
+        self._win_max.clicked.connect(self._toggle_maximize)
+        self._win_close.clicked.connect(self.close)
+
+    def _make_win_button(self, icon: FluentIcon, object_name: str) -> ToolButton:
+        """Создаёт компактную системную кнопку управления окном."""
+        btn = ToolButton(icon, self)
+        btn.setObjectName(object_name)
+        btn.setFixedSize(34, 30)
+        return btn
+
+    def _toggle_maximize(self) -> None:
+        """Переключает окно между развёрнутым и нормальным состоянием."""
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _on_mode_changed(self, mode_key: str) -> None:
+        """Реагирует на смену режима: обновляет welcome-экран."""
+        self.set_mode(mode_key)
+
+    # -------------------------------------------------------------------------
+    # Центральная лента чата + градиентное угасание
+    # -------------------------------------------------------------------------
+    def _build_chat_area(self) -> None:
+        """Собирает область ленты чата с welcome-экраном и угасанием."""
+        self._canvas = QWidget(self)
+        canvas_layout = QVBoxLayout(self._canvas)
+        canvas_layout.setContentsMargins(20, 12, 20, 0)
+        canvas_layout.setSpacing(0)
+
+        # Верхняя панель: сегмент режимов по центру, системные кнопки справа.
+        top_bar = QHBoxLayout()
+        top_bar.addStretch(1)
+        top_bar.addWidget(self._segment)
+        top_bar.addStretch(1)
+        top_bar.addWidget(self._win_min)
+        top_bar.addWidget(self._win_max)
+        top_bar.addWidget(self._win_close)
+        canvas_layout.addLayout(top_bar)
+        canvas_layout.addSpacing(4)
+
+        # Прокручиваемая лента сообщений (objectName для стилей без белого фона).
+        self._scroll = SmoothScrollArea(self._canvas)
+        self._scroll.setObjectName("chatScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        viewport = QWidget(self._scroll)
+        viewport.setObjectName("chatViewport")
+        self._chat_layout = QVBoxLayout(viewport)
+        self._chat_layout.setContentsMargins(0, 4, 0, 4)
+        self._chat_layout.setSpacing(2)
+        self._chat_layout.addStretch(1)  # держит сообщения сверху
+        self._scroll.setWidget(viewport)
+        canvas_layout.addWidget(self._scroll, 1)
+
+        # Welcome-экраны накладываются поверх ленты чата. Прозрачны для мыши,
+        # чтобы не перехватывать клики по капсуле ввода и сегменту режимов.
+        self._welcome = WelcomeHost(self._canvas)
+        self._welcome.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._welcome.setGeometry(self._scroll.geometry())
+        self._welcome.raise_()
+        self._chat_has_messages = False
+
+        # Градиентное угасание над капсулой ввода (позиционируется в resizeEvent).
+        self._fade_overlay = FadeOutOverlay(self._canvas)
+        self._fade_overlay.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """Позиционирует welcome-экран и градиентное угасание по размеру окна."""
+        super().resizeEvent(event)
+        if hasattr(self, "_welcome"):
+            # Welcome покрывает только область ленты чата (между сегментом и капсулой).
+            self._welcome.setGeometry(self._scroll.geometry())
+        self._reposition_fade_overlay()
+
+    def _reposition_fade_overlay(self) -> None:
+        """Размещает градиентный слой непосредственно над парящей капсулой."""
+        if not hasattr(self, "_fade_overlay") or not hasattr(self, "_capsule"):
+            return
+        # Капсула вложена в хост-контейнер, поэтому переводим её координаты
+        # в систему отсчёта канвы, чтобы слой угасания лёг точно над капсулой.
+        origin = self._capsule.mapTo(self._canvas, QPoint(0, 0))
+        overlay_width = self._capsule.width()
+        self._fade_overlay.setGeometry(
+            origin.x(),
+            origin.y() - self._fade_overlay.height(),
+            overlay_width,
+            self._fade_overlay.height(),
+        )
+        self._fade_overlay.raise_()
+
+    # -------------------------------------------------------------------------
+    # Парящая капсула ввода + миниатюра «Ножниц»
+    # -------------------------------------------------------------------------
+    def _build_input_capsule(self) -> None:
+        """Создаёт парящую капсулу ввода со встроенными кнопками (+) и (📷, ↑)."""
+        self._capsule_host = QWidget(self._canvas)
+        host_layout = QVBoxLayout(self._capsule_host)
+        host_layout.setContentsMargins(
+            self.PADDING, 0, self.PADDING, self.PADDING
+        )
+        host_layout.setSpacing(8)
+
+        # Миниатюра контекста «Ножниц» — парит НАД капсулой ввода.
+        self._preview = ScreenshotPreview(self._capsule_host)
+        self._preview.closed.connect(self._clear_screenshot)
+        host_layout.addWidget(self._preview, 0, Qt.AlignmentFlag.AlignLeft)
+
+        # Сама капсула ввода — кнопки сидят ВНУТРИ текстовой рамки.
+        self._capsule = InputCapsule(self._capsule_host)
+        self._capsule.send_requested.connect(self._on_send_from_capsule)
+        self._capsule.plus_clicked.connect(lambda: self._notify_in_dev("Вложения"))
+        self._capsule.camera_clicked.connect(self._launch_snipper)
+
+        host_layout.addWidget(self._capsule)
+        self._canvas.layout().addWidget(self._capsule_host)
+
+    def _on_send_from_capsule(self, text: str) -> None:
+        """Обрабатывает отправку текста из капсулы ввода."""
+        self.send_requested.emit(text)
+        self._append_user_message(text)
+        self._capsule.clear()
+        self._hide_welcome()
+
+    # -------------------------------------------------------------------------
+    # Действия: отправка, Ножницы, уведомления, перетаскивание окна
+    # -------------------------------------------------------------------------
+    def _append_user_message(self, text: str) -> None:
+        """Добавляет «бабл» пользователя в ленту чата."""
+        row = MessageRow(self._scroll)
+        row.show_user(text)
+        self._chat_layout.insertWidget(self._chat_layout.count() - 1, row)
+        self._scroll_to_bottom()
+
+    def append_ai_message(self, text: str, thinking: str = "") -> None:
+        """Добавляет свободный ответ ИИ в ленту чата (публичный API)."""
+        row = MessageRow(self._scroll)
+        row.show_ai(text, thinking)
+        self._chat_layout.insertWidget(self._chat_layout.count() - 1, row)
+        self._scroll_to_bottom()
+        return row
+
+    def _scroll_to_bottom(self) -> None:
+        """Плавно прокручивает ленту чата к последнему сообщению."""
+        bar = self._scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _hide_welcome(self) -> None:
+        """Скрывает welcome-экран после появления первого сообщения."""
+        if not self._chat_has_messages:
+            self._chat_has_messages = True
+            self._welcome.hide()
+
+    def _launch_snipper(self) -> None:
+        """Запускает оверлей «Ножниц» и показывает миниатюру результата."""
+        overlay = ScreenSnipperOverlay(self)
+        overlay.captured.connect(self._on_screenshot_captured)
+        overlay.exec()
+
+    def _on_screenshot_captured(self, pixmap: QPixmap, bbox: tuple) -> None:
+        """Отображает миниатюру снимка «Ножниц» над капсулой ввода."""
+        self._current_screenshot = pixmap
+        self._preview.set_pixmap(pixmap)
+        self._reposition_fade_overlay()
+
+    def _clear_screenshot(self) -> None:
+        """Удаляет снимок из памяти и прячет миниатюру."""
+        self._current_screenshot = None
+        self._preview.hide()
+
+    def _notify_in_dev(self, feature: str) -> None:
+        """Показывает всплывающее Fluent-уведомление о разработке функции."""
+        InfoBar.info(
+            title="В разработке",
+            content=f"«{feature}» будет доступно на следующем этапе.",
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=3000,
+            parent=self,
+        )
+
+    def set_mode(self, mode: str) -> None:
+        """Переключает активный режим и обновляет welcome-экран."""
+        self._mode = mode
+        self._welcome.set_mode(mode)
+        self._welcome.raise_()
+
+    # -------------------------------------------------------------------------
+    # Перетаскивание безрамочного окна мышью (захват на верхней панели)
+    # -------------------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """Захватывает окно для перетаскивания при нажатии на шапке."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        """Перемещает безрамочное окно вслед за мышью при зажатой кнопке."""
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        """Завершает перетаскивание окна."""
+        self._drag_offset = None
+
+
+if __name__ == "__main__":
+    import sys
+
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())

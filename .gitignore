@@ -5,6 +5,7 @@
 
 # Временный кэш компиляции Python
 __pycache__/
+my_env/
 *.pyc
 *.pyo
 *.pyd
@@ -26,3 +27,4 @@ Desktop.ini
 autolisp-rules.md
 Plan.docx
 _pyautocad/
+daman-canon_рабочая версия.md
