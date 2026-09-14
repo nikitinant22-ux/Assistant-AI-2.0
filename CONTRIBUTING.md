@@ -73,29 +73,16 @@ gh pr create --base main --fill
 
 ## Уборка веток после мержа
 
-Постоянное решение — галка в настройках:
-`Settings` → `General` → `Pull Requests` → **Automatically delete head
-branches**. После неё ветка удаляется сама при каждом мерже.
+В настройках репозитория включена галка `Settings` → `General` →
+`Pull Requests` → **Automatically delete head branches**: ветка удаляется сама
+при каждом мерже pull request, делать ничего не нужно.
 
-Галка не убирает то, что накопилось раньше. Для этого есть
-`scripts/cleanup-merged-branches.ps1`:
+Галка не трогает две вещи: ветку закрытого без мержа pull request и ветку,
+для которой pull request не заводили вовсе. Такие удаляются вручную —
+на странице `branches` или командой:
 
-```powershell
-.\scripts\cleanup-merged-branches.ps1          # показать, что будет удалено
-.\scripts\cleanup-merged-branches.ps1 -Apply   # удалить
-```
-
-Без ключа `-Apply` скрипт только читает. Удаляются лишь ветки со смерженным
-pull request: ветка по умолчанию, защищённая ветка, ветка с открытым pull
-request и ветка вовсе без pull request не трогаются никогда — за последней
-может стоять чья-то незаконченная работа.
-
-Калибровка скрипта — `scripts/cleanup-merged-branches.Tests.ps1`. Она гоняет
-настоящий скрипт на подставных данных, наружу не ходит и ничего не удаляет.
-Запускать после любой правки скрипта:
-
-```powershell
-.\scripts\cleanup-merged-branches.Tests.ps1
+```bash
+git push origin --delete имя-ветки
 ```
 
 ## Что намеренно не в репозитории
