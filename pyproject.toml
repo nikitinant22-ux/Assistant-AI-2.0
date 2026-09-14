@@ -1,5 +1,5 @@
 [project]
 name = "my-first-project"
-version = "1.0.3"  # Эту версию скрипт будет обновлять автоматически
+version = "1.0.4"  # Эту версию скрипт будет обновлять автоматически
 description = "My first automated Python project"
 dependencies = []
