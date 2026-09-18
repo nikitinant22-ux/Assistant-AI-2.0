@@ -1,6 +1,6 @@
 [project]
 name = "assistant-ai"
-version = "1.0.6"  # Эту версию скрипт будет обновлять автоматически
+version = "1.0.7"  # Эту версию скрипт будет обновлять автоматически
 description = "Ассистент для инженерной работы с AutoCAD: интерфейс Fluent Design на PyQt6 и маршрутизация запросов к локальным моделям Ollama"
 requires-python = ">=3.11"
 dependencies = [
