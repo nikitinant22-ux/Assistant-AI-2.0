@@ -1,0 +1,24 @@
+{
+  // Конфигурация статического анализатора Pylance (pyright).
+  // Задача: подсказать анализатору, где искать локальную копию библиотеки
+  // pyautocad (папка _pyautocad/pyautocad-master), которая подключается
+  // в sys.path динамически во время выполнения. Это убирает ложную
+  // подсветку "Import 'pyautocad' could not be resolved" в tools_core.py.
+  "extraPaths": [
+    "_pyautocad/pyautocad-master"
+  ],
+  "reportMissingImports": true,
+  "pythonVersion": "3.11",
+  // Платформа Windows: гарантирует корректную типизацию платформо-зависимых
+  // модулей (например, ctypes.windll в cad_ui_core.py) без ложных ошибок.
+  "pythonPlatform": "Windows",
+  // Анализировать исходный код сторонних библиотек (PyQt6, qfluentwidgets),
+  // чтобы их API корректно типизировался и не возникало ложных проблем.
+  "useLibraryCodeForTypes": true,
+  // ЯВНАЯ привязка виртуального окружения проекта: pyright/Pylance берут
+  // интерпретатор и его site-packages из ./my_env, где установлены все
+  // зависимости (PyQt6, qfluentwidgets, requests, pyautocad и др.).
+  // venvPath задаётся ОТНОСИТЕЛЬНО каталога данного конфиг-файла.
+  "venvPath": ".",
+  "venv": "my_env"
+}

@@ -5,11 +5,15 @@
 """
 
 from __future__ import annotations
+import json
 import os
+import re
+import time
+from html import escape
 from typing import Optional
 from PyQt6.QtCore import (
     QByteArray, QEasingCurve, QEvent, QPoint, QPropertyAnimation,
-    QRect, QRectF, QSize, Qt, QTimer, pyqtSignal,
+    QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QCursor, QColor, QFontMetricsF, QGuiApplication, QIcon,
@@ -18,18 +22,79 @@ from PyQt6.QtGui import (
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
-    QPlainTextEdit, QPushButton, QRubberBand, QSizePolicy, QVBoxLayout, QWidget
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRubberBand,
+    QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    FluentIcon, IconWidget, InfoBar, InfoBarPosition,
+    FluentIcon, IconWidget, InfoBar, InfoBarPosition, ProgressRing,
     SegmentedWidget, SmoothScrollArea, ToolButton, setTheme, Theme
 )
 import cad_ui_styles as styles
 
-# Ядро связи: фоновый поток стриминга Ollama и разбор блока рассуждений.
-from core_core import ChainedChatWorker, OllamaWorker, split_thinking
-# Единая точка входа логики ИИ-суждений (Канон 11.1) — стерильный роутер-заглушка.
-from main_router import route_request
+# Ядро связи: одномодельный фоновый поток стриминга llama-server, разбор блока
+# рассуждений <thinking>, прогрев кэша лимитов контекста (n_ctx) и оценка
+# токенов для статус-бара капсулы. Старая цепочка DeepSeek/Mistral ликвидирована.
+from core_core import (
+    LlamaWorker, estimate_tokens, fetch_server_limits, get_cached_n_ctx,
+    prewarm_server_limits, split_thinking,
+)
+# Пакет атомарных кубиков САПР «пакет пакетов» (Этап 6, Шаг 1). Единый
+# сквозной импорт: автосканер tools/__init__.py при старте приложения
+# загружает все кубики из подпапок и регистрирует их в реестре. Мост
+# ensure_connection() опрашивается фоновым потоком CadStatusPoller для
+# светодиода подключения и имени активного DWG-чертежа (Зона 3 капсулы).
+import tools
+# Единая точка входа логики ИИ-суждений (Канон 11.1) — стерильный роутер.
+# execute_tool_commands — исполнительный контур: по завершении стриминга
+# извлекает JSON-команды из ответа модели и вызывает кубики через реестр.
+from main_router import (
+    CAD_FUSE_MARKER, execute_tool_commands, route_request,
+    set_cad_connection_state,
+)
+# Локальный менеджер сессий чатов: чтение/запись JSON-файлов в папке history/
+# корня проекта, автоименование новых диалогов по первому запросу (Этап 3).
+from history_manager import HistoryManager
+
+
+# Порог «прилипания» чата к нижнему краю (в пикселях): пока пользователь не
+# прокрутил ленту вверх дальше этого расстояния, чат автоматически следует за
+# стримом ИИ вниз. Как только ручная прокрутка уводит ползунок за порог —
+# автоследование отключается, чтобы чтение истории не прерывалось рывками.
+CHAT_SCROLL_PIN_THRESHOLD_PX: int = 100
+
+# Период фонового опроса связи с AutoCAD для светодиода и имени чертежа (сек).
+# Опрос живёт в отдельном потоке, поэтому даже при потерянном COM-указателе
+# интерфейс не зависает: повторное подключение выполняется за кадром.
+CAD_STATUS_POLL_INTERVAL_SEC: float = 3.0
+
+# Регулярное выражение блока скрытых размышлений Qwen3 (без учёта регистра,
+# с допуском пробелов вокруг имени тега и DOTALL для многострочного черновика).
+# Используется функцией clean_response_for_history при записи реплик ассистента
+# в память чата — черновик мыслей намертво вырезается из истории (Пока-ёкэ
+# зацикливания), а JSON-пакеты команд и текстовые итоги остаются нетронутыми.
+_THINK_TAGS_RE = re.compile(
+    r"<\s*thinking\s*>.*?<\s*/\s*thinking\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def clean_response_for_history(raw_text: str) -> str:
+    """Стерилизует ответ ассистента перед записью в память чата (Пока-ёкэ).
+
+    Намертво вырезает всё, что находится внутри тегов <thinking>...</thinking>,
+    чтобы при повторной подаче истории в контекст llama-server модель не
+    «зацикливалась» на собственном черновике рассуждений. Прошлые JSON-блоки
+    команд кубиков и текстовые итоги при этом остаются в строке нетронутыми —
+    модель сохраняет контекст прошлых геометрических построений САПР.
+
+    Аргументы:
+        raw_text: сырой текст ответа ассистента (может содержать теги мыслей).
+
+    Возвращает:
+        str — очищенный текст, пригодный для сохранения в chat_history.
+    """
+    clean_text = _THINK_TAGS_RE.sub("", raw_text)
+    return clean_text.strip()
 
 
 def load_svg_icon(
@@ -59,6 +124,251 @@ def load_svg_icon(
         return None
 
 
+# ---------------------------------------------------------------------------
+# Мини-конвертер Markdown → HTML для QLabel.
+#
+# Модель пишет разметку звёздочками (**полужирный**, *курсив*), заголовки ###,
+# списки, цитаты и таблицы, а QLabel сам её не понимает — поэтому превращаем
+# её в подмножество HTML, которое Qt умеет рендерить как Rich Text
+# (Канон 16.5: пояснения на русском, код — ASCII).
+# ---------------------------------------------------------------------------
+
+_BLOCK_RE = re.compile(r"```(\w*)\n?(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_BOLD_ITALIC_RE = re.compile(r"\*\*\*(?!\s)(.+?)(?<!\s)\*\*\*", re.DOTALL)
+_BOLD_RE = re.compile(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", re.DOTALL)
+_ITALIC_RE = re.compile(r"(?<!\w)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\w)")
+_STRIKE_RE = re.compile(r"(?<!\w)~~(?!\s)(.+?)(?<!\s)~~(?!\w)", re.DOTALL)
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s\"]+)\)")
+_PLACEHOLDER_RE = re.compile(r"\x01(BLOCK|CODE)(\d+)\x01")
+
+# Структурная разметка на уровне строк. Проверяется ДО применения звёздочек,
+# чтобы маркеры списков (-, *, +) не путались с курсивом, а | в таблицах —
+# с обычным текстом. Инлайн-код к этому моменту уже спрятан в плейсхолдеры
+# \x01CODE..\x01, поэтому трубы внутри `кода` таблицы не ломают.
+_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_HR_RE = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
+_QUOTE_RE = re.compile(r"^>\s?(.*)$")
+_TASK_RE = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(.+)$")
+_UL_ITEM_RE = re.compile(r"^\s*[-*+]\s+(.+)$")
+_OL_ITEM_RE = re.compile(r"^\s*(\d+)[.)]\s+(.+)$")
+_TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Делит строку таблицы |a|b|c| на ячейки (обрезает пробелы)."""
+    cells = line.strip().strip("|").split("|")
+    return [c.strip() for c in cells]
+
+
+def md_to_html(text: str) -> str:
+    """Преобразует подмножество Markdown в HTML для QLabel (Rich Text).
+
+    Поддерживается то, что модель реально использует в ответах:
+
+    * **жирный текст**, *курсив*, ***жирный курсив***, ~~зачёркнутый~~
+    * [текст](https://...)
+    * `инлайн-код` и ```блок кода``` (JSON и т.п.)
+    * # .. ###### заголовки, --- горизонтальные черты
+    * - * + ненумерованные списки, 1. нумерованные, - [x] чек-листы
+    * > цитаты и |...| таблицы
+
+    Весь остальной текст экранируется от HTML, поэтому «сырые» теги модели
+    (например, `<фигура>`) не ломают вёрстку, а показываются как обычный текст.
+    Внутри блоков и инлайн-кода звёздочки НЕ превращаются в разметку.
+    """
+    if not text:
+        return ""
+
+    code_blocks: list[str] = []
+
+    def _capture(m: re.Match) -> str:
+        # Первый проход: блочный код ```...``` изолируем плейсхолдером.
+        body = m.group(2).rstrip("\n")
+        code_blocks.append(body)
+        return f"\x01BLOCK{len(code_blocks) - 1}\x01"
+
+    text = _BLOCK_RE.sub(_capture, text)
+
+    # Инлайн-разметка применяется ПОСЛЕ разбора структуры, к «сырому»
+    # содержимому каждого блока: экранируем HTML, прячем `инлайн-код`,
+    # затем подставляем звёздочки, ссылки и зачёркивание.
+    def _render_inline(s: str) -> str:
+        """Экранирует строку и применяет инлайн-разметку Markdown."""
+
+        def _capture_inline(m: re.Match) -> str:
+            code_blocks.append(m.group(1))
+            return f"\x01CODE{len(code_blocks) - 1}\x01"
+
+        s = escape(s, quote=False)
+        s = _INLINE_CODE_RE.sub(_capture_inline, s)
+        s = _LINK_RE.sub(r'<a href="\2" style="color:#4fc3f7;">\1</a>', s)
+        s = _STRIKE_RE.sub(r"<s>\1</s>", s)
+        # Сначала тройные звёздочки, потом двойные, потом одинарные.
+        s = _BOLD_ITALIC_RE.sub(r"<b><i>\1</i></b>", s)
+        s = _BOLD_RE.sub(r"<b>\1</b>", s)
+        s = _ITALIC_RE.sub(r"<i>\1</i>", s)
+        return _PLACEHOLDER_RE.sub(_restore, s)
+
+    # Возвращаем изолированные куски кода на место.
+    def _restore(m: re.Match) -> str:
+        kind, idx = m.group(1), int(m.group(2))
+        body = escape(code_blocks[idx])
+        if kind == "BLOCK":
+            return (
+                '<pre style="font-family: Consolas, monospace; font-size: 13px; '
+                'background-color: #141414; color: #d4d4d4; border-radius: 6px; '
+                'padding: 8px 10px;">' + body + "</pre>"
+            )
+        return (
+            '<code style="font-family: Consolas, monospace; background-color: #2a2a2a; '
+            'color: #9cdcfe; border-radius: 4px; padding: 1px 4px;">' + body + "</code>"
+        )
+
+    def _render_table(header: list[str], rows: list[list[str]]) -> str:
+        """Собирает <table> из заголовка и строк-тела (Qt Rich Text)."""
+        parts = ['<table border="1" cellspacing="0" cellpadding="4" '
+                 'style="border-collapse: collapse; margin: 6px 0;">']
+        head = "".join(
+            '<th bgcolor="#141414" style="color: #e8e8e8; padding: 4px 8px;">'
+            + _render_inline(c) + "</th>"
+            for c in header
+        )
+        parts.append("<tr>" + head + "</tr>")
+        for row in rows:
+            cells = "".join(
+                '<td style="color: #d4d4d4; padding: 4px 8px;">' + _render_inline(c) + "</td>"
+                for c in row
+            )
+            parts.append("<tr>" + cells + "</tr>")
+        parts.append("</table>")
+        return "".join(parts)
+
+    # Структуру разбираем на «сырых» строках: символы >, |, #, -, * ещё не
+    # экранированы, поэтому цитаты, таблицы, заголовки и списки распознаются
+    # корректно. Экранирование и звёздочки применяются только к содержимому.
+    lines = text.split("\n")
+    html_parts: list[str] = []
+    pending: list[str] = []          # накопленные строки обычного абзаца
+    i, n = 0, len(lines)
+
+    def flush_paragraph() -> None:
+        """Сбрасывает накопленный абзац в <p> с переносами <br/>."""
+        if not pending:
+            return
+        body = "<br/>".join(_render_inline(p) for p in pending)
+        html_parts.append(f'<p style="margin:0 0 6px 0;">{body}</p>')
+        pending.clear()
+
+    while i < n:
+        line = lines[i]
+
+        # Таблица: строка-заголовок |...| + строка-разделитель |---|---|.
+        if _TABLE_ROW_RE.match(line) and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1]):
+            flush_paragraph()
+            header = _split_table_row(line)
+            rows: list[list[str]] = []
+            j = i + 2
+            while j < n and _TABLE_ROW_RE.match(lines[j]) and not _TABLE_SEP_RE.match(lines[j]):
+                rows.append(_split_table_row(lines[j]))
+                j += 1
+            html_parts.append(_render_table(header, rows))
+            i = j
+            continue
+
+        # Горизонтальная черта --- (кроме хвостовой декорации в конце сообщения).
+        if _HR_RE.match(line) and any(l.strip() for l in lines[i + 1:]):
+            flush_paragraph()
+            html_parts.append(
+                '<hr style="border: none; border-top: 1px solid #2a2a2a; margin: 8px 0;"/>'
+            )
+            i += 1
+            continue
+
+        # Заголовки # .. ######.
+        hm = _HEADER_RE.match(line)
+        if hm:
+            flush_paragraph()
+            level = len(hm.group(1))
+            size = {1: 22, 2: 19, 3: 16, 4: 14, 5: 13, 6: 12}[level]
+            title = _render_inline(hm.group(2))
+            html_parts.append(
+                f'<h{level} style="margin: 10px 0 6px 0; font-size: {size}px; '
+                f'font-weight: 700; color: #e8e8e8;">{title}</h{level}>'
+            )
+            i += 1
+            continue
+
+        # Цитата > текст (подряд идущие строки склеиваются в один блок).
+        qm = _QUOTE_RE.match(line)
+        if qm:
+            flush_paragraph()
+            quote_lines: list[str] = []
+            while i < n:
+                inner = _QUOTE_RE.match(lines[i])
+                if not inner:
+                    break
+                quote_lines.append(inner.group(1))
+                i += 1
+            body = "<br/>".join(_render_inline(q) for q in quote_lines)
+            html_parts.append(
+                '<div style="border-left: 3px solid #2196F3; padding: 4px 10px; '
+                'margin: 6px 0; color: #9a9a9a; font-style: italic;">' + body + "</div>"
+            )
+            continue
+
+        # Ненумерованный список - * + (внутри распознаются и чек-листы).
+        if _UL_ITEM_RE.match(line):
+            flush_paragraph()
+            items: list[str] = []
+            while i < n:
+                task = _TASK_RE.match(lines[i])
+                if task:
+                    box = "✅" if task.group(1).strip().lower() == "x" else "⬜"
+                    items.append(
+                        "<li>" + box + " " + _render_inline(task.group(2)) + "</li>"
+                    )
+                    i += 1
+                    continue
+                inner = _UL_ITEM_RE.match(lines[i])
+                if not inner:
+                    break
+                items.append("<li>" + _render_inline(inner.group(1)) + "</li>")
+                i += 1
+            html_parts.append(
+                '<ul style="margin: 4px 0 8px 0; padding-left: 20px;">'
+                + "".join(items) + "</ul>"
+            )
+            continue
+
+        # Нумерованный список 1. / 1).
+        if _OL_ITEM_RE.match(line):
+            flush_paragraph()
+            items: list[str] = []
+            while i < n:
+                inner = _OL_ITEM_RE.match(lines[i])
+                if not inner:
+                    break
+                items.append("<li>" + _render_inline(inner.group(2)) + "</li>")
+                i += 1
+            html_parts.append(
+                '<ol style="margin: 4px 0 8px 0; padding-left: 20px;">'
+                + "".join(items) + "</ol>"
+            )
+            continue
+
+        # Обычный текст: пустая строка завершает абзац, остальное копится.
+        if not line.strip():
+            flush_paragraph()
+        else:
+            pending.append(line)
+        i += 1
+
+    flush_paragraph()
+    return "".join(html_parts)
+
+
 class HubIconButton(QPushButton):
     """Кнопка-иконка с двумя состояниями: обычным и при наведении курсора.
 
@@ -77,52 +387,252 @@ class HubIconButton(QPushButton):
         if normal is not None:
             self.setIcon(normal)
 
+    def set_hover_state(self, hovered: bool) -> None:
+        """Программно включает/выключает состояние наведения (для строк-кнопок).
+
+        Нужен контейнеру HubActionRow: его внутренняя иконка прозрачна для
+        событий мыши, поэтому переключение Regular -> Filled выполняет сам
+        контейнер при наведении курсора на строку хаба.
+        """
+        if hovered and self.isEnabled() and self._hover_icon is not None:
+            self.setIcon(self._hover_icon)
+        elif self._normal_icon is not None:
+            self.setIcon(self._normal_icon)
+
     def enterEvent(self, event) -> None:
         # Отключённая кнопка не должна подсвечиваться (менять иконку на hover).
-        if self.isEnabled() and self._hover_icon is not None:
-            self.setIcon(self._hover_icon)
+        self.set_hover_state(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        if self._normal_icon is not None:
-            self.setIcon(self._normal_icon)
+        self.set_hover_state(False)
         super().leaveEvent(event)
+
+class HubActionRow(QFrame):
+    """Монолитная кликабельная строка «иконка + подпись» верхней панели хаба.
+
+    Иконка и текст упакованы в ЕДИНЫЙ кликабельный виджет: клик по любой точке
+    строки — по иконке, по тексту или по пустому месту — испускает РОВНО один
+    сигнал ``clicked``. Дубли исключены конструктивно: внутренняя иконка
+    (оригинальный HubIconButton со сменой Regular -> Filled) и подпись
+    прозрачны для событий мыши, поэтому все нажатия обрабатывает сама строка.
+    В свёрнутом виде хаба подпись скрывается — остаётся только иконка.
+    """
+    clicked = pyqtSignal()
+
+    def __init__(
+        self,
+        normal_icon: Optional[QIcon],
+        hover_icon: Optional[QIcon],
+        text: str,
+        parent: Optional[QWidget] = None,
+        button_object_name: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("hubActionRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Внутренняя иконка переиспользует оригинальный класс HubIconButton —
+        # визуальный стиль иконок хаба не меняется.
+        self._icon = HubIconButton(normal_icon, hover_icon, self)
+        if button_object_name:
+            # Возвращаем оригинальный objectName (hubAddBtn/hubHistBtn): без
+            # него на кнопку не действуют стили «background-color: transparent»
+            # из глобальной таблицы, и Qt рисует её «родным» светлым фоном
+            # Windows вместо иконки (белый квадрат).
+            self._icon.setObjectName(button_object_name)
+        self._icon.setFixedSize(24, 24)
+        self._icon.setIconSize(QSize(20, 20))
+        self._label = QLabel(text, self)
+        # Иконка и текст прозрачны для мыши: события уходят родителю-строке,
+        # благодаря чему клик по тексту срабатывает наравне с кликом по иконке.
+        self._icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._lay = QHBoxLayout(self)
+        self._lay.setSpacing(8)
+        self._lay.addWidget(self._icon)
+        self._lay.addWidget(self._label)
+        self._lay.addStretch(1)
+        # По умолчанию строка живёт в свёрнутом хабе — симметричные поля.
+        self._apply_margins(False)
+
+    def _apply_margins(self, expanded: bool) -> None:
+        """Переключает поля строки под состояние хаба.
+
+        В свёрнутом виде свободная ширина рейки невелика: при широких полях
+        (6+6) под 24px-иконку не оставалось места, и она смещалась вбок с
+        клиппингом. Симметричные поля 4+4 дают ровно 24px — иконка встаёт
+        строго по центру бокса. В развёрнутом виде возвращается воздух под
+        подпись текста (6+6).
+        """
+        if expanded:
+            self._lay.setContentsMargins(6, 4, 6, 4)
+        else:
+            self._lay.setContentsMargins(4, 4, 4, 4)
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Показывает/скрывает подпись и переключает поля строки."""
+        self._label.setVisible(expanded)
+        self._apply_margins(expanded)
+
+    def enterEvent(self, event) -> None:
+        # Передаём состояние наведения иконке (подмена Regular -> Filled).
+        self._icon.set_hover_state(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._icon.set_hover_state(False)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        # Срабатывание только по левой кнопке, отпущенной внутри строки:
+        # перетаскивание за пределы строки кликом не считается.
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+class ChatListItemWidget(QFrame):
+    """Строка реального чата в списке Инженерного хаба.
+
+    Слева — название чата (клик загружает сессию в окно переписки), справа —
+    минималистичная кнопка ✕ (QToolButton), появляющаяся ТОЛЬКО при наведении
+    курсора и запрашивающая удаление физического JSON-файла сессии с диска.
+    """
+    session_clicked = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)
+
+    def __init__(
+        self,
+        session_id: str,
+        title: str,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("chatItem")
+        self.session_id = session_id
+        self.title = title
+        self.setMinimumHeight(40)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 0, 4, 0)
+        lay.setSpacing(4)
+        self._label = QLabel(title, self)
+        # Подпись прозрачна для мыши: клик по названию обрабатывает сам QFrame.
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._label.setToolTip(title)
+        lay.addWidget(self._label, 1)
+
+        self._del_btn = QToolButton(self)
+        self._del_btn.setObjectName("chatItemDelete")
+        self._del_btn.setText("✕")
+        self._del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._del_btn.setToolTip("Удалить чат")
+        self._del_btn.hide()
+        # Кнопка удаления перехватывает события мыши у родительского QFrame,
+        # поэтому клик по ✕ НЕ загружает сессию и не дублирует сигналы.
+        self._del_btn.clicked.connect(
+            lambda: self.delete_requested.emit(self.session_id)
+        )
+        lay.addWidget(self._del_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def enterEvent(self, event) -> None:
+        # Кнопка ✕ появляется только при наведении курсора на строку.
+        self._del_btn.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._del_btn.hide()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        # Клик по названию чата загружает его сессию в окно переписки
+        # (левый клик, отпущен внутри строки).
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.session_clicked.emit(self.session_id)
+        super().mouseReleaseEvent(event)
 
 class ThinkingSpoiler(QWidget):
     """Сворачиваемый подзаголовок «Размышления...» модели DeepSeek-R1.
 
-    Показывает подзаголовок «Размышления...», сразу после которого расположена
-    стрелка вниз (▼). Тело рассуждений по умолчанию скрыто; раскрыть его можно,
-    нажав на стрелку — тогда она меняется на «▲», а текст мыслей показывается.
+    Показывает подзаголовок «Размышления...», сразу после которого расположен
+    шеврон Fluent (ChevronDown20/ChevronUp20 из папки icons). Тело рассуждений
+    по умолчанию скрыто; раскрыть его можно, нажав на стрелку — тогда шеврон
+    динамически меняется наверх, а текст мыслей показывается.
     """
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 4, 0, 2)
         self._layout.setSpacing(2)
-        # Строка заголовка: фраза «Размышления...» и стрелка вниз сразу после неё.
+        # Строка заголовка: фраза «Размышления...» и стрелка-шеврон после неё.
         self._header = QHBoxLayout()
         self._header.setSpacing(2)
         self._label = QLabel("Размышления...", self)
         self._label.setObjectName("thinkingLabel")
-        self._arrow = QPushButton("▼", self)
+        # Заголовок спойлера — текстовое содержимое чата: курсор IBeam.
+        self._label.setCursor(Qt.CursorShape.IBeamCursor)
+        # Стрелка-шеврон Fluent (ChevronUp20/ChevronDown20 из папки icons):
+        # вниз — спойлер свёрнут, вверх — развёрнут. Иконка подменяется
+        # динамически при переключении, а на hover Regular сменяется Filled
+        # и светлеет (тот же паттерн, что и в HubIconButton).
+        icon_size = 16
+        self._arrow = QPushButton(self)
         self._arrow.setObjectName("thinkingArrow")
         self._arrow.setCursor(Qt.CursorShape.PointingHandCursor)
         self._arrow.setCheckable(True)
+        self._arrow.setIconSize(QSize(icon_size, icon_size))
+        # Кортежи (обычная, hover) для каждого направления шеврона.
+        dim = styles.Palette.TEXT_DIM
+        bright = styles.Palette.TEXT
+        self._icons_down = (
+            load_svg_icon("ChevronDown20Regular.svg", color=dim, size=icon_size),
+            load_svg_icon("ChevronDown20Filled.svg", color=bright, size=icon_size),
+        )
+        self._icons_up = (
+            load_svg_icon("ChevronUp20Regular.svg", color=dim, size=icon_size),
+            load_svg_icon("ChevronUp20Filled.svg", color=bright, size=icon_size),
+        )
+        self._hovered = False
+        self._apply_arrow_icon()
         self._header.addWidget(self._label)
         self._header.addWidget(self._arrow)
         self._header.addStretch(1)
         self._body = QLabel("", self)
         self._body.setObjectName("thinkingBody")
         self._body.setWordWrap(True)
+        # Нативный QLabel в PyQt6 сам IBeam не ставит — задаём явно, заодно
+        # разрешаем выделение текста мыши (флаг честно соответствует курсору).
+        self._body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._body.setCursor(Qt.CursorShape.IBeamCursor)
         self._body.hide()
         self._layout.addLayout(self._header)
         self._layout.addWidget(self._body)
         self._arrow.clicked.connect(self._on_toggle)
 
+    def _apply_arrow_icon(self) -> None:
+        """Актуализирует иконку шеврона под состояние спойлера и курсора."""
+        icons = self._icons_up if self._arrow.isChecked() else self._icons_down
+        self._arrow.setIcon(icons[1] if self._hovered else icons[0])
+
     def _on_toggle(self, checked: bool) -> None:
         self._body.setVisible(checked)
-        self._arrow.setText("▲" if checked else "▼")
+        self._apply_arrow_icon()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self._apply_arrow_icon()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self._apply_arrow_icon()
+        super().leaveEvent(event)
 
     def set_thinking(self, text: str) -> None:
         self._body.setText(text)
@@ -138,7 +648,7 @@ class ThinkingSpoiler(QWidget):
         видимости тела.
         """
         self._body.setText(text)
-        self._arrow.setText("▲" if self._body.isVisible() else "▼")
+        self._apply_arrow_icon()
 
 class CardThumbnail(QLabel):
     """Миниатюра в карточке сообщения.
@@ -300,6 +810,9 @@ class ExpandableCaption(QLabel):
         self._text = text
         self._expanded = False
         self.setMinimumWidth(1)
+        # Курсор управляется динамически в _reflow: «рука» при переполнении,
+        # иначе IBeam (обычный текст).
+        self.setCursor(Qt.CursorShape.IBeamCursor)
 
     # ------------------------------------------------------------------ данные
     def text(self) -> str:
@@ -340,6 +853,11 @@ class ExpandableCaption(QLabel):
         h = self._visible_lines() * self._line_height() + 2 * self.PAD_Y
         if h != self.height():
             self.setFixedHeight(h)
+        # Актуализируем курсор: переполнение => есть что развернуть («рука»).
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if self._overflow else Qt.CursorShape.IBeamCursor
+        )
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -395,6 +913,52 @@ class ExpandableCaption(QLabel):
         painter.end()
 
 
+class ChatTextLabel(QLabel):
+    """QLabel сообщения с честным курсором: I-образный над текстом.
+
+    Нативный QLabel в текущей сборке PyQt6 НЕ показывает IBeam даже с флагом
+    TextSelectableByMouse (проверено эмпирически диагностическим зондом):
+    курсор остаётся стрелкой. Этот подкласс сам отслеживает мышь: над обычным
+    текстом — IBeam, над кликабельной ссылкой — «рука», при уходе курсора
+    возвращает IBeam вместо стрелки.
+
+    Ссылка под курсором определяется сигналом linkHovered, который Qt шлёт
+    самостоятельно: методов linkAt()/document() в этой версии PyQt6 нет, а
+    ловить исключения при каждом движении мыши нельзя (падало приложение).
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        # Без mouseTracking mouseMoveEvent приходит только при зажатой кнопке,
+        # а нам нужно обновлять курсор при простом наведении.
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        self._over_link = False          # курсор сейчас над ссылкой?
+        self.linkHovered.connect(self._on_link_hovered)
+
+    def _on_link_hovered(self, link: str) -> None:
+        """Сигнал Qt: мышь вошла в зону ссылки rich-text или покинула её."""
+        self._over_link = bool(link)
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if link else Qt.CursorShape.IBeamCursor
+        )
+
+    def mouseMoveEvent(self, event) -> None:
+        # Состояние уже поддерживается сигналом linkHovered; здесь лишь
+        # применяем его к курсору — без исключений и геометрических поисков.
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if self._over_link else Qt.CursorShape.IBeamCursor
+        )
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._over_link = False
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        super().leaveEvent(event)
+
+
 class MessageRow(QWidget):
     """Строка сообщения: баблы справа для инженера, чистый текст слева для ИИ."""
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -406,9 +970,15 @@ class MessageRow(QWidget):
         self._right_stretch = QWidget(self)
         # Метка ответа ИИ создаётся заранее, чтобы её можно было обновлять на
         # лету во время потоковой генерации (в отличие от статичного show_ai).
-        self._label = QLabel(self)
+        # Кастомная метка: IBeam над текстом, «рука» над ссылками Markdown.
+        self._label = ChatTextLabel(self)
         self._label.setObjectName("aiAnswer")
         self._label.setWordWrap(True)
+        # Метка рендерит Markdown модели (**жирный**, *курсив*, ### заголовки,
+        # списки, таблицы) как Rich Text: весь текст ответа пропускается через
+        # md_to_html() перед setText(). Ссылки открываются в браузере по клику.
+        self._label.setTextFormat(Qt.TextFormat.RichText)
+        self._label.setOpenExternalLinks(True)
         self._label.setMaximumWidth(700)
         # Горизонтально метка занимает всю доступную ширину (до 700px), а не
         # схлопывается в узкий столбец под свой sizeHint. Высота при wordWrap
@@ -417,7 +987,12 @@ class MessageRow(QWidget):
         self._label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
-        self._label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # TextSelectableByMouse — выделение текста, LinksAccessibleByMouse —
+        # обязательный флаг для сигнала linkHovered (наведение на ссылки).
+        self._label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
         self._spoiler = None          # спойлер мыслей создаётся лениво
         self._ai_wrap = QWidget(self)
         self._ai_layout = QVBoxLayout(self._ai_wrap)
@@ -450,9 +1025,8 @@ class MessageRow(QWidget):
             if not text.strip():
                 # Без текста подпись не нужна: миниатюра занимает всю карточку.
                 caption.hide()
-            else:
-                # Курсор-«рука», когда есть что развернуть/свернуть.
-                caption.setCursor(Qt.CursorShape.PointingHandCursor)
+            # Курсор подписи управляется самой подписью (см. _reflow):
+            # «рука» при переполнении, IBeam для обычного текста.
             cv.addWidget(thumb, 0)
             cv.addWidget(caption, 0)
 
@@ -469,11 +1043,17 @@ class MessageRow(QWidget):
         v.setContentsMargins(12, 10, 12, 10)
         v.setSpacing(8)
 
-        txt = QLabel(bubble)
+        txt = ChatTextLabel(bubble)
         txt.setObjectName("userBubbleText")
         txt.setWordWrap(True)
-        txt.setText(text)
-        txt.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        txt.setTextFormat(Qt.TextFormat.RichText)
+        txt.setOpenExternalLinks(True)
+        txt.setText(md_to_html(text))
+        # Те же флаги взаимодействия, что у ответа ИИ: выделение + ссылки.
+        txt.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
         v.addWidget(txt, 0, Qt.AlignmentFlag.AlignLeft)
 
         self._layout.addWidget(self._left_stretch, 1)
@@ -518,7 +1098,7 @@ class MessageRow(QWidget):
         состояния раскрытия. Спойлер создаётся лениво при первом появлении мыслей.
         """
         self._mount_ai()
-        self._label.setText(answer)
+        self._label.setText(md_to_html(answer))
         if thinking:
             if self._spoiler is None:
                 self._spoiler = ThinkingSpoiler(self)
@@ -527,11 +1107,11 @@ class MessageRow(QWidget):
         self._refresh_ai_geometry()
 
     def set_thinking_only(self, thinking: str) -> None:
-        """Обновляет ТОЛЬКО блок мыслей Дипсика, не трогая текст ответа.
+        """Обновляет ТОЛЬКО блок мыслей модели, не трогая текст ответа.
 
-        Используется конвейером «Чат» (ChainedChatWorker): рассуждения Ведущего
-        Архитектора показываются в раскрывающемся спойлере, а видимый финальный
-        ответ параллельно стримит Помощник архитектора (Мистраль).
+        Используется LlamaWorker (одномодельная архитектура): англоязычные
+        рассуждения Qwen3 внутри <thinking> показываются в раскрывающемся
+        спойлере, а видимый русскоязычный финальный ответ рисуется отдельно.
         """
         self._mount_ai()
         if thinking:
@@ -979,24 +1559,225 @@ class ScreenSnipperOverlay(QDialog):
             self.reject()
         else:
             super().keyPressEvent(event)
+
+class MessageInput(QPlainTextEdit):
+    """Поле ввода сообщения с боевыми сочетаниями клавиш.
+
+    Enter (без модификаторов) — отправка сообщения: событие поглощается,
+    чтобы QPlainTextEdit не вставлял перевод строки.
+    Shift+Enter — классический перенос каретки на следующую строку.
+    """
+    submit_requested = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+
+    def keyPressEvent(self, event) -> None:
+        # Enter без Shift (в т.ч. цифровой клавиатуры) — отправляем сообщение
+        # и блокируем вставку перевода строки штатным обработчиком.
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            self.submit_requested.emit()
+            event.accept()
+            return
+        # Shift+Enter и все остальные клавиши — стандартное поведение (перенос).
+        super().keyPressEvent(event)
+
+class CadStatusPoller(QThread):
+    """Фоновый опрос связи с AutoCAD для статус-строки капсулы (Зона 3).
+
+    Опрос ensure_connection() выполняется в отдельном потоке, поэтому даже
+    при потере COM-указателя (перезапуск AutoCAD) интерфейс не зависает:
+    повторное подключение с паузами живёт в фоне, а в главный поток уходит
+    только компактный сигнал с результатом проверки.
+
+    Сигналы:
+        status_changed(bool, str, str): (подключено, имя_документа, полный_путь).
+    """
+    status_changed = pyqtSignal(bool, str, str)
+
+    def run(self) -> None:
+        # Интервал дробится на короткие шаги, чтобы поток быстро завершался
+        # по requestInterruption при закрытии окна приложения.
+        steps = max(1, int(CAD_STATUS_POLL_INTERVAL_SEC * 2))
+        while not self.isInterruptionRequested():
+            connected = False
+            name = ""
+            full_path = ""
+            try:
+                acad = tools.ensure_connection()
+                if acad is not None:
+                    doc = acad.ActiveDocument
+                    name = str(getattr(doc, "Name", "") or "")
+                    full_path = str(getattr(doc, "FullName", "") or "")
+                    connected = True
+            except Exception:
+                connected = False
+            self.status_changed.emit(connected, name, full_path)
+            for _ in range(steps):
+                if self.isInterruptionRequested():
+                    return
+                time.sleep(0.5)
+
+
+# Период heartbeat-опроса лимитов llama-server для прогрессбара контекста (мс).
+SERVER_LIMITS_POLL_INTERVAL_MS: int = 10000
+
+
+class ServerLimitsPoller(QThread):
+    """Фоновый heartbeat-опрос параметров llama-server (прогрессбар контекста).
+
+    Каждые 10 секунд форсированно перечитывает n_ctx с локального C++ сервера
+    (GET /props с фолбэком на /v1/models). Это снимает главную проблему
+    статичного индикатора: однократный прогрев при старте мог закэшировать
+    безопасный дефолт 4096, даже когда сервер реально поднят с окном 16384.
+    Теперь максимум прогрессбара динамически перестраивается на лету, как
+    только связь с llama-server восстанавливается (Пока-ёкэ рассинхронизации).
+
+    Сетевой вызов выполняется в этом потоке, поэтому главный поток GUI никогда
+    не блокируется; в интерфейс уходит только компактный сигнал с числом.
+
+    Сигналы:
+        limits_updated(int): актуальный размер контекстного окна n_ctx.
+    """
+    limits_updated = pyqtSignal(int)
+
+    def run(self) -> None:
+        # Интервал дробится на короткие шаги, чтобы поток быстро завершался
+        # по requestInterruption при закрытии окна приложения.
+        steps = max(1, int(SERVER_LIMITS_POLL_INTERVAL_MS / 500))
+        while not self.isInterruptionRequested():
+            # Форсированный опрос: кэш core_core перезаписывается живым
+            # значением (16384 и т.п.); при таймауте сохраняется последний
+            # известный лимит либо безопасный дефолт 4096 (не блокируя UI).
+            n_ctx = fetch_server_limits(force=True)
+            self.limits_updated.emit(int(n_ctx))
+            for _ in range(steps):
+                if self.isInterruptionRequested():
+                    return
+                time.sleep(0.5)
+
+
+class ContextRing(ProgressRing):
+    """Кольцо контекста с кастомным тултипом-полоской (Fluent Design).
+
+    Наведение на кольцо раскрывает маленькую карточку-подсказку: текст
+    в тысячах токенов с процентом и НАСТОЯЩАЯ тонкая акцентная полоска
+    прогресса — вместо ASCII-квадратиков стандартного QToolTip (Пока-ёкэ
+    читаемости заполненности контекста).
+    """
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(26, 26)
+        self._strokeWidth = 4          # тонкая дуга флюент-кольца
+        self.setTextVisible(False)
+        self.setRange(0, 4096)
+
+        # Карточка-подсказка: текст токенов + тонкая полоска прогресса.
+        self._tip = QFrame(None)
+        self._tip.setObjectName("contextRingTip")
+        # Отдельное окно без рамок поверх всех окон (как штатный QToolTip).
+        self._tip.setWindowFlags(
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+        )
+        self._tip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        tip_layout = QVBoxLayout(self._tip)
+        tip_layout.setContentsMargins(10, 8, 10, 8)
+        tip_layout.setSpacing(6)
+        self._tip_label = QLabel("Использовано: 0к / 4к токенов (0%)", self._tip)
+        self._tip_label.setObjectName("contextTipLabel")
+        self._tip_bar = QProgressBar(self._tip)
+        self._tip_bar.setObjectName("contextBar")
+        self._tip_bar.setFixedSize(140, 6)
+        self._tip_bar.setTextVisible(False)
+        self._tip_bar.setRange(0, 4096)
+        tip_layout.addWidget(self._tip_label)
+        tip_layout.addWidget(self._tip_bar)
+        self._tip.adjustSize()
+        self._tip.hide()
+
+    def update_progress(self, used: int, max_tokens: int, percent: int) -> None:
+        """Синхронно обновляет кольцо, полоску тултипа и текст токенов."""
+        self.setRange(0, max_tokens)
+        self.setValue(used)
+        self._tip_bar.setRange(0, max_tokens)
+        self._tip_bar.setValue(used)
+        self._tip_label.setText(
+            "Использовано: {}к / {}к токенов ({}%)".format(
+                used // 1000, max_tokens // 1000, percent
+            )
+        )
+        self._tip.adjustSize()
+
+    def _position_tip(self) -> None:
+        top_left = self.mapToGlobal(QPoint(0, 0))
+        x = top_left.x() + (self.width() - self._tip.width()) // 2
+        y = top_left.y() - self._tip.height() - 8
+        # У верхней кромки экрана карточку показываем под кольцом.
+        screen = QGuiApplication.screenAt(QPoint(x, y))
+        if screen is None or y < screen.availableGeometry().top():
+            y = top_left.y() + self.height() + 8
+        self._tip.move(x, y)
+
+    def enterEvent(self, event) -> None:
+        # Показываем карточку над кольцом по центру при наведении курсора.
+        self._position_tip()
+        self._tip.show()
+        self._tip.raise_()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._tip.hide()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        # Кольцо скрыто (например, при схлопывании зон) — прячем тултип.
+        self._tip.hide()
+        super().hideEvent(event)
+
+
 class InputCapsule(QFrame):
+    """Монолитная трёхзонная парящая капсула ввода.
+
+    Зона 1 (верх): панель медиа-контекста — готовое превью скриншота.
+        Схлопывается по высоте (setVisible(False)), пока скриншота нет.
+    Зона 2 (центр): свободное текстовое поле на 100% ширины капсулы,
+        внутри поля больше нет встроенных кнопок.
+    Зона 3 (низ): панель параметров и действий — скрепка, светодиод
+        AutoCAD, имя DWG-чертежа с многострочным тултипом, бар контекста
+        токенов, кнопки «Ножницы» и отправки.
+    """
     send_requested = pyqtSignal(str)
     plus_clicked = pyqtSignal()
     camera_clicked = pyqtSignal()
+    preview_closed = pyqtSignal()
+    input_changed = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("inputCapsule")
-        # Динамическая высота капсулы — растёт до MAX_LINES строк ввода.
+        # Динамическая высота Зоны 2 — растёт до MAX_LINES строк ввода.
         self.MAX_LINES: int = 6
-        # Минимальная высота: вмещает самые крупные кнопки капсулы (38px).
-        self.MIN_HEIGHT: int = 52
-        self.input = QPlainTextEdit(self)
+        # Минимальная высота поля ввода: одна строка + вертикальные отступы.
+        self.FIELD_MIN_HEIGHT: int = 44
+        # Есть ли прикреплённый скриншот, ожидающий отправки.
+        self._has_attachment = False
+
+        # ------------------------------------------------------------------
+        # ЗОНА 2: свободное текстовое поле (центр, 100% ширины капсулы).
+        # ------------------------------------------------------------------
+        self.input = MessageInput(self)
         self.input.setObjectName("messageInput")
         self.input.setPlaceholderText("Введите сообщение…")
         self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Enter без Shift — отправка сообщения через штатный обработчик капсулы.
+        self.input.submit_requested.connect(self._on_send_clicked)
         self.input.textChanged.connect(self._update_send_state)
         self.input.textChanged.connect(self._resize_to_content)
+        # Проброс изменения текста наружу (обновление бара контекста в Зоне 3).
+        self.input.textChanged.connect(self.input_changed)
         # Явно задаём светлый цвет текста и каретки: иначе мигающий курсор
         # наследует тёмный цвет и становится невидимым на графитовом фоне.
         input_pal = self.input.palette()
@@ -1014,8 +1795,26 @@ class InputCapsule(QFrame):
         if QApplication.cursorFlashTime() <= 0:
             QApplication.setCursorFlashTime(1000)
 
-        # Кнопка прикрепления: обычное состояние — Attach24Regular,
-        # при наведении — более жирная Attach24Filled.
+        # ------------------------------------------------------------------
+        # ЗОНА 1: панель медиа-контекста (верх) — превью скриншота.
+        # Готовый виджет ScreenshotPreview сохраняет всю нативную логику:
+        # кнопку удаления, кнопку раскрытия на весь экран и hover-оверлей.
+        # ------------------------------------------------------------------
+        self.preview = ScreenshotPreview(self)
+        self.preview.closed.connect(self.preview_closed)
+        self._preview_zone = QWidget(self)
+        self._preview_zone.setObjectName("mediaZone")
+        media_layout = QHBoxLayout(self._preview_zone)
+        media_layout.setContentsMargins(0, 0, 0, 0)
+        media_layout.setSpacing(0)
+        media_layout.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignLeft)
+        media_layout.addStretch(1)
+
+        # ------------------------------------------------------------------
+        # ЗОНА 3: нижняя панель параметров и действий.
+        # ------------------------------------------------------------------
+        # Кнопка-скрепка: обычное состояние — Attach24Regular, при наведении —
+        # более жирная Attach24Filled (левое крыло).
         self.plus_btn = HubIconButton(
             load_svg_icon("Attach24Regular.svg"),
             load_svg_icon("Attach24Filled.svg"),
@@ -1027,8 +1826,23 @@ class InputCapsule(QFrame):
         self.plus_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.plus_btn.clicked.connect(self.plus_clicked)
 
-        # Кнопка скриншота: обычное состояние — CameraAdd24Regular,
-        # при наведении — жирная CameraAdd24Filled.
+        # Светодиод-индикатор подключения к AutoCAD (🟢/🔴 по ensure_connection).
+        self.status_led = QLabel("🔴", self)
+        self.status_led.setObjectName("statusLed")
+        self.status_led.setToolTip("AutoCAD не подключён")
+
+        # Имя текущего DWG-чертежа с многострочным тултипом (путь + файл).
+        self.dwg_label = QLabel("Нет подключения", self)
+        self.dwg_label.setObjectName("dwgNameLabel")
+
+        # Кольцо заполненности контекста (Fluent Design, правое крыло).
+        # Круговой индикатор ProgressRing — «спинер» прогресса: тонкое кольцо
+        # с акцентной дугой, а наведение раскрывает тултип с полоской прогресса.
+        self.context_ring = ContextRing(self)
+        self.context_ring.setObjectName("contextRing")
+
+        # Кнопка фотоаппарата «Ножницы»: обычное состояние — CameraAdd24Regular,
+        # при наведении — жирная CameraAdd24Filled (правое крыло).
         self.camera_btn = HubIconButton(
             load_svg_icon("CameraAdd24Regular.svg"),
             load_svg_icon("CameraAdd24Filled.svg"),
@@ -1054,8 +1868,29 @@ class InputCapsule(QFrame):
         self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send_btn.setEnabled(False)
         self.send_btn.clicked.connect(self._on_send_clicked)
-        # Есть ли прикреплённый скриншот, ожидающий отправки.
-        self._has_attachment = False
+
+        # Горизонтальный слой Зоны 3: левое крыло и правое крыло, в котором
+        # кольцо контекста прижато к правому краю рядом с кнопками действий.
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setSpacing(8)
+        bottom_bar.addWidget(self.plus_btn)       # скрепка (левое крыло)
+        bottom_bar.addWidget(self.status_led)     # светодиод AutoCAD
+        bottom_bar.addWidget(self.dwg_label)      # имя чертежа (левое крыло)
+        bottom_bar.addStretch(1)                  # пружина — правое крыло к краю
+        bottom_bar.addWidget(self.context_ring)   # кольцо контекста (правое крыло)
+        bottom_bar.addWidget(self.camera_btn)     # «Ножницы» (правое крыло)
+        bottom_bar.addWidget(self.send_btn)       # отправка (правое крыло)
+
+        # Сборка монолитной капсулы из трёх вертикальных зон.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 10)
+        root.setSpacing(6)
+        root.addWidget(self._preview_zone)   # Зона 1 (скрыта до скриншота)
+        root.addWidget(self.input)           # Зона 2 (поле ввода)
+        root.addLayout(bottom_bar)           # Зона 3 (панель параметров)
+
+        # Зона 1 изначально схлопнута: скриншота в памяти ещё нет.
+        self._preview_zone.hide()
 
         # ВАЖНО: НЕ переопределяем focusInEvent/focusOutEvent экземпляра лямбдами —
         # это ломает стандартную отрисовку и мигание каретки QPlainTextEdit.
@@ -1066,8 +1901,10 @@ class InputCapsule(QFrame):
         self._resize_to_content()
 
     def _resize_to_content(self) -> None:
-        """Подгоняет высоту капсулы под число строк ввода (не более MAX_LINES).
+        """Подгоняет высоту поля ввода под число строк (не более MAX_LINES).
 
+        Высота всей капсулы складывается layout'ом из трёх зон автоматически;
+        здесь фиксируется только высота самого текстового поля (Зона 2).
         Используем lineCount() — он учитывает переносы длинного текста,
         а не только абзацы (Enter).
         """
@@ -1079,8 +1916,11 @@ class InputCapsule(QFrame):
         # Симметричный вертикальный отступ текста в боксе (padding-top/bottom из QSS),
         # чтобы нижняя строка не прижималась к границе.
         v_pad = 10
-        height = max(self.MIN_HEIGHT, int(round(line_h * target)) + 2 * margin + 2 * v_pad + 2)
-        self.setFixedHeight(height)
+        field_h = max(
+            self.FIELD_MIN_HEIGHT,
+            int(round(line_h * target)) + 2 * margin + 2 * v_pad + 2,
+        )
+        self.input.setFixedHeight(field_h)
         # Пока строки помещаются — держим прокрутку в начале, чтобы первая
         # строка не «улетала» за верхнюю границу при росте высоты капсулы.
         # Сброс делаем отложенно: Qt сам прокручивает к каретке сразу после
@@ -1113,8 +1953,15 @@ class InputCapsule(QFrame):
             self.send_requested.emit(text)
 
     def set_has_screenshot(self, has: bool) -> None:
-        """Учитывает прикреплённый скриншот при расчёте доступности отправки."""
+        """Учитывает скриншот в отправке и схлопывает/раскрывает Зону 1.
+
+        При отсутствии скриншота Зона 1 полностью скрывается по высоте
+        (setVisible(False)) — капсула возвращается к двухзонному виду.
+        """
         self._has_attachment = bool(has)
+        self._preview_zone.setVisible(has)
+        if not has:
+            self.preview.hide()
         self._update_send_state()
 
     def _update_send_state(self) -> None:
@@ -1128,19 +1975,12 @@ class InputCapsule(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        w, h = self.width(), self.height()
-        self.input.setGeometry(0, 0, w, h)
-        # Кнопки прижаты к низу бокса и не смещаются при росте высоты.
-        self.plus_btn.move(6, h - 36 - 6)
-        self.camera_btn.move(w - 86, h - 36 - 6)
-        self.send_btn.move(w - 45, h - 38 - 6)
-
 class MainWindow(QMainWindow):
     send_requested = pyqtSignal(str)
     # Ширина Инженерного хаба в свёрнутом (только кнопки) и развёрнутом виде.
-    RAIL_WIDTH: int = 44
+    # 48px — рейка с запасом: 24px-иконка с симметричными полями 4px встаёт
+    # ровно по центру бокса (при 44px контент вылезал за края строки).
+    RAIL_WIDTH: int = 48
     HUB_MAX_WIDTH: int = 264
     PADDING: int = 18
 
@@ -1165,6 +2005,23 @@ class MainWindow(QMainWindow):
         self._pending_screenshot: Optional[QPixmap] = None
         # Буфер сырого текста текущей потоковой генерации (для разбора <thinking>).
         self._stream_raw: str = ""
+        # Двухконтурная стерильная память чата: массив реплик {"role", "content"}.
+        # Ответы ассистента попадают сюда ТОЛЬКО после чистки clean_response_for_history
+        # (теги <thinking> вырезаны), поэтому у модели сохраняется контекст прошлых
+        # построений без риска зацикливания на собственном черновике рассуждений.
+        self._chat_history: list = []
+        # Локальный менеджер сессий: JSON-файлы диалогов лежат в папке history/
+        # корня проекта (Этап 3). Папка создаётся при первом обращении.
+        self._history_manager = HistoryManager()
+        # ID активной сессии (uuid) и её название. None означает дефолтное
+        # приветственное состояние: физического файла на диске ещё нет.
+        self._active_session_id: Optional[str] = None
+        self._session_title: Optional[str] = None
+        # Фоновый опрос оборудования llama-server: n_ctx кэшируется в core_core
+        # daemon-потоком БЕЗ блокировки GUI, чтобы первый запрос LlamaWorker
+        # уже знал фактический размер контекстного окна (дефолт 4096 лишь при
+        # недоступности сервера).
+        prewarm_server_limits()
 
         self._build_rail_and_drawer()
         self._build_center_canvas()
@@ -1192,34 +2049,33 @@ class MainWindow(QMainWindow):
         hub_layout.setContentsMargins(8, 12, 8, 8)
         hub_layout.setSpacing(8)
 
-        # Кнопка создания чата: обычное состояние — Regular, при наведении — Filled.
-        self._new_chat_btn = HubIconButton(
+        # Монолитные кликабельные строки верхней панели: иконка и подпись
+        # упакованы в ЕДИНЫЙ виджет, поэтому клик по тексту срабатывает наравне
+        # с кликом по иконке (ровно одно срабатывание — без дублей сигналов).
+        # Иконки — оригинальные (ChatSparkle / LineHorizontal3), стиль не меняем;
+        # в свёрнутом виде хаба подписи скрываются, остаются только иконки.
+        self._new_chat_row = HubActionRow(
             load_svg_icon("ChatSparkle24Regular.svg"),
             load_svg_icon("ChatSparkle24Filled.svg"),
+            "Создать новый чат",
             self._hub_panel,
+            button_object_name="hubAddBtn",
         )
-        self._new_chat_btn.setObjectName("hubAddBtn")
-        self._new_chat_btn.setFixedSize(24, 24)
-        self._new_chat_btn.setIconSize(QSize(20, 20))
-        self._new_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._new_chat_btn.clicked.connect(lambda: self._notify_in_dev("Новый чат"))
+        self._new_chat_row.clicked.connect(self._on_new_chat)
 
-        # Кнопка истории чатов: обычное состояние — Regular, при наведении — Filled.
-        self._history_btn = HubIconButton(
+        self._history_row = HubActionRow(
             load_svg_icon("LineHorizontal324Regular.svg"),
             load_svg_icon("LineHorizontal324Filled.svg"),
+            "Свернуть вкладку",
             self._hub_panel,
+            button_object_name="hubHistBtn",
         )
-        self._history_btn.setObjectName("hubHistBtn")
-        self._history_btn.setFixedSize(24, 24)
-        self._history_btn.setIconSize(QSize(20, 20))
-        self._history_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._history_btn.clicked.connect(self._on_history_click)
+        self._history_row.clicked.connect(self._on_history_click)
 
-        hub_layout.addWidget(self._new_chat_btn)
-        hub_layout.addWidget(self._history_btn)
+        hub_layout.addWidget(self._new_chat_row)
+        hub_layout.addWidget(self._history_row)
 
-        # Черта-разделитель идёт сразу под кнопками.
+        # Черта-разделитель идёт сразу под кнопками (дизайн не меняем).
         self._hub_divider = HubDividerLine(self._hub_panel)
         hub_layout.addWidget(self._hub_divider)
 
@@ -1238,37 +2094,196 @@ class MainWindow(QMainWindow):
         # занимает всю свободную высоту, не давая кнопкам «разъехаться».
         hub_layout.addStretch(1)
 
+        # Регистр реальных чатов из папки history/ — динамические строки
+        # ChatListItemWidget вместо старых текстовых заглушек.
+        self._history_items: dict = {}
+        self._active_history_item: Optional[ChatListItemWidget] = None
+        self._rebuild_history_list()
+
         # В свёрнутом виде черта и чаты полностью скрыты, чтобы из-под узкой
         # полосы не торчали фрагменты названий. Появляются при развороте хаба.
         self._hub_divider.hide()
         self._history_scroll.hide()
-
-        for title in ["Чертёж фундамента", "Спецификация кабеля", "План освещения"]:
-            item = QFrame(self._history_scroll)
-            item.setObjectName("chatItem")
-            item.setFixedHeight(40)
-            l = QHBoxLayout(item)
-            l.setContentsMargins(12, 0, 6, 0)
-            l.addWidget(QLabel(title, item))
-            self._history_list.insertWidget(0, item)
+        # Подписи верхних кнопок тоже показываются только в развёрнутом виде.
+        self._set_drawer_rows_expanded(False)
 
         # Анимация ширины хаба: свёрнут до RAIL_WIDTH, разворачивается до HUB_MAX_WIDTH.
         self._drawer_anim = QPropertyAnimation(self._hub_panel, b"maximumWidth", self)
         self._drawer_anim.setDuration(200)
         self._drawer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
-    def _on_history_click(self, event) -> None:
+    def _on_history_click(self) -> None:
+        """Разворачивает/сворачивает Инженерный хаб («Свернуть вкладку»).
+
+        В развёрнутом виде под кнопками появляются черта-разделитель, список
+        реальных чатов и подписи самих верхних кнопок; при сворачивании всё это
+        прячется, чтобы из-под узкой полосы не торчали фрагменты названий.
+        """
         self._drawer_visible = not self._drawer_visible
         # Черта и чаты существуют только в развёрнутом виде — прячем целиком,
         # а не оставляем обрезанными под узкой полосой.
         self._hub_divider.setVisible(self._drawer_visible)
         self._history_scroll.setVisible(self._drawer_visible)
+        self._set_drawer_rows_expanded(self._drawer_visible)
         self._drawer_anim.stop()
         self._drawer_anim.setStartValue(self._hub_panel.width())
         self._drawer_anim.setEndValue(
             self.HUB_MAX_WIDTH if self._drawer_visible else self.RAIL_WIDTH
         )
         self._drawer_anim.start()
+
+    def _set_drawer_rows_expanded(self, expanded: bool) -> None:
+        """Показывает/скрывает подписи верхних кнопок хаба (иконки не трогаем)."""
+        self._new_chat_row.set_expanded(expanded)
+        self._history_row.set_expanded(expanded)
+
+    def _on_new_chat(self) -> None:
+        """Создаёт новый чат: очищает экран и сбрасывает активную сессию.
+
+        Лента сообщений очищается, ID активной сессии обнуляется, интерфейс
+        возвращается в дефолтное приветственное состояние. Физический JSON-файл
+        прежней сессии остаётся на диске в папке history/ — он уже сохранён.
+        """
+        self._clear_chat_view()
+        self._chat_history.clear()
+        self._active_session_id = None
+        self._session_title = None
+        self._chat_has_messages = False
+        self._capsule.clear()
+        self._welcome.show()
+        self._welcome.raise_()
+        self._set_active_history_item(None)
+        self._refresh_context_bar()
+
+    def _clear_chat_view(self) -> None:
+        """Полностью очищает ленту сообщений, оставляя нижнюю растяжку."""
+        while self._chat_layout.count() > 1:
+            item = self._chat_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _load_session(self, session_id: str) -> None:
+        """Загружает массив messages выбранной сессии в окно переписки.
+
+        Лента пересобирается из JSON-файла папки history/: пользовательские
+        реплики рисуются баблами справа, ответы ассистента — слева. Скриншоты
+        в файлах не хранятся (хранится только текст), поэтому карточки
+        изображений при загрузке не восстанавливаются.
+        """
+        data = self._history_manager.load_session(session_id)
+        if data is None:
+            return
+        self._clear_chat_view()
+        self._chat_history = [dict(m) for m in data.get("messages", [])]
+        self._active_session_id = session_id
+        self._session_title = data.get("title", "Новый чат")
+        for msg in self._chat_history:
+            row = MessageRow(self._scroll)
+            content = str(msg.get("content", ""))
+            if msg.get("role") == "user":
+                row.show_user(content)
+            else:
+                row.show_ai(content, "")
+            self._chat_layout.insertWidget(self._chat_layout.count() - 1, row)
+        if self._chat_history:
+            self._chat_has_messages = True
+            self._welcome.hide()
+        else:
+            self._chat_has_messages = False
+            self._welcome.show()
+            self._welcome.raise_()
+        self._set_active_history_item(self._history_items.get(session_id))
+        self._scroll_to_bottom()
+        self._refresh_context_bar()
+
+    def _on_delete_session(self, session_id: str) -> None:
+        """Подтверждает и удаляет сессию: физический файл + плавное исчезновение.
+
+        Сначала спрашивает подтверждение у пользователя, затем удаляет
+        JSON-файл с диска ПК и анимирует схлопывание строки в списке хаба.
+        Если удалена открытая в данный момент сессия — экран возвращается
+        в дефолтное приветственное состояние.
+        """
+        item = self._history_items.get(session_id)
+        if item is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Удаление чата",
+            f"Удалить чат «{item.title}»? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        # 1) Физическое удаление JSON-файла сессии с диска ПК.
+        self._history_manager.delete_session(session_id)
+        # 2) Плавное схлопывание строки в интерфейсе.
+        self._history_items.pop(session_id, None)
+        self._history_list.removeWidget(item)
+        start_h = item.height()
+        anim = QPropertyAnimation(item, b"maximumHeight", self)
+        anim.setDuration(180)
+        anim.setStartValue(start_h)
+        anim.setEndValue(0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        anim.valueChanged.connect(lambda v: item.setFixedHeight(int(v)))
+        anim.finished.connect(item.deleteLater)
+        anim.start()
+        # 3) Если удалена открытая сессия — возвращаемся к приветствию.
+        if session_id == self._active_session_id:
+            self._on_new_chat()
+
+    def _persist_chat(self) -> None:
+        """Сохраняет текущую сессию в JSON-файл папки history/ (идемпотентно).
+
+        Вызывается после каждой добавленной реплики (пользователя или
+        ассистента). Если активной сессии ещё нет — вызов безопасно игнорируется.
+        """
+        if not self._active_session_id:
+            return
+        self._history_manager.save_session(
+            self._active_session_id,
+            self._session_title or "Новый чат",
+            self._chat_history,
+        )
+
+    def _rebuild_history_list(self) -> None:
+        """Перестраивает список реальных чатов из папки history/ (новые сверху).
+
+        При старте и после создания новой сессии список полностью пересобирается
+        из JSON-файлов на диске, гарантируя актуальность названий и порядка.
+        """
+        for item in list(self._history_items.values()):
+            self._history_list.removeWidget(item)
+            item.deleteLater()
+        self._history_items.clear()
+        for session in self._history_manager.list_sessions():
+            item = ChatListItemWidget(
+                str(session.get("id", "")),
+                str(session.get("title", "Новый чат")),
+            )
+            item.session_clicked.connect(self._load_session)
+            item.delete_requested.connect(self._on_delete_session)
+            self._history_items[session["id"]] = item
+            # Вставка в начало + сортировка «новые сверху» = свежайший диалог
+            # оказывается самой верхней строкой списка.
+            self._history_list.insertWidget(0, item)
+        self._active_history_item = None
+
+    def _set_active_history_item(self, item: Optional[ChatListItemWidget]) -> None:
+        """Подсвечивает активную сессию в списке и снимает старую подсветку."""
+        if self._active_history_item is not None:
+            self._active_history_item.setProperty("active", False)
+            self._active_history_item.style().unpolish(self._active_history_item)
+            self._active_history_item.style().polish(self._active_history_item)
+        self._active_history_item = item
+        if item is not None:
+            item.setProperty("active", True)
+            item.style().unpolish(item)
+            item.style().polish(item)
 
     def _build_center_canvas(self) -> None:
         self._canvas = QWidget(self)
@@ -1308,6 +2323,13 @@ class MainWindow(QMainWindow):
         self._scroll = SmoothScrollArea(self._canvas)
         self._scroll.setObjectName("chatScroll")
         self._scroll.setWidgetResizable(True)
+        # Автоследование за стримом: пока пользователь находится у нижнего края,
+        # лента сама прокручивается вниз при каждом чанке. Любой уход ползунка
+        # вверх (колесо, перетаскивание, клавиши) снимает флаг — см. _on_chat_scrolled.
+        self._pinned_to_bottom = True
+        self._scroll.verticalScrollBar().valueChanged.connect(
+            self._on_chat_scrolled
+        )
 
         viewport = QWidget(self._scroll)
         viewport.setObjectName("chatViewport")
@@ -1332,22 +2354,47 @@ class MainWindow(QMainWindow):
         host.setObjectName("inputHost")
         host_layout = QVBoxLayout(host)
         host_layout.setContentsMargins(self.PADDING, 0, self.PADDING, self.PADDING)
-        # При изменении размера контейнера ввода (рост бокса, появление/скрытие
-        # превью скриншота) виньетка маскировки над боксом должна следовать за
-        # его верхней кромкой, иначе она «наедет» на поле ввода.
+        # При изменении размера контейнера ввода (рост капсулы, появление/скрытие
+        # Зоны 1 с превью скриншота) виньетка маскировки над боксом должна
+        # следовать за его верхней кромкой, иначе она «наедет» на поле ввода.
         self._input_host = host
         host.installEventFilter(self)
 
-        self._preview = ScreenshotPreview(host)
-        self._preview.closed.connect(self._clear_screenshot)
-        host_layout.addWidget(self._preview, 0, Qt.AlignmentFlag.AlignLeft)
-
+        # Монолитная трёхзонная капсула: превью скриншота (Зона 1), свободное
+        # текстовое поле (Зона 2) и панель параметров/действий (Зона 3) живут
+        # внутри одной парящей капсулы; превью больше не подвешивается рядом.
         self._capsule = InputCapsule(host)
         self._capsule.send_requested.connect(self._on_send)
         self._capsule.camera_clicked.connect(self._launch_snipper)
         self._capsule.plus_clicked.connect(lambda: self._notify_in_dev("Прикрепление файлов"))
+        self._capsule.preview_closed.connect(self._clear_screenshot)
+        self._capsule.input_changed.connect(self._refresh_context_bar)
         host_layout.addWidget(self._capsule)
         layout.addWidget(host)
+
+        # Фоновый опрос связи с AutoCAD для светодиода и имени DWG (Зона 3).
+        self._cad_poller = CadStatusPoller(self)
+        self._cad_poller.status_changed.connect(self._on_cad_status)
+        self._cad_poller.start()
+
+        # Лёгкий таймер: когда daemon-поток core_core наполнит кэш n_ctx,
+        # бар контекста пересчитается с фактическим лимитом llama-server.
+        self._last_context_max: Optional[int] = None
+        self._context_cache_timer = QTimer(self)
+        self._context_cache_timer.setInterval(2000)
+        self._context_cache_timer.timeout.connect(self._poll_context_cache)
+        self._context_cache_timer.start()
+
+        # Динамический heartbeat-опрос llama-server (10 с): даже если прогрев
+        # при старте застал сервер выключенным, кэш n_ctx обновится на лету,
+        # как только связь восстановится, и максимум бара контекста мгновенно
+        # перестроится (например, с дефолтных 4096 на реальные 16384).
+        self._limits_poller = ServerLimitsPoller(self)
+        self._limits_poller.limits_updated.connect(self._on_server_limits_updated)
+        self._limits_poller.start()
+
+        # Бар контекста заполняется сразу, не дожидаясь первого ввода.
+        self._refresh_context_bar()
 
     def _on_send(self, text: str) -> None:
         pixmap = self._pending_screenshot
@@ -1357,27 +2404,52 @@ class MainWindow(QMainWindow):
         row.show_user(text, pixmap)
         self._chat_layout.insertWidget(self._chat_layout.count() - 1, row)
         self._capsule.clear()
+        # Первый контур памяти: пользовательская реплика уходит в историю целиком,
+        # без каких-либо тегов <thinking> (их модель в запросах не использует).
+        if text.strip():
+            self._chat_history.append({"role": "user", "content": text})
+            # Первое сообщение в дефолтном приветственном состоянии порождает
+            # реальную сессию: автоматическое именование (3-4 слова запроса,
+            # обрезанные до 25 символов) и физическое создание JSON-файла
+            # в папке history/ корня проекта.
+            if self._active_session_id is None:
+                title = HistoryManager.make_title_from_prompt(text)
+                self._active_session_id = self._history_manager.create_session(
+                    title, []
+                )
+                self._session_title = title
+                self._rebuild_history_list()
+                self._set_active_history_item(
+                    self._history_items.get(self._active_session_id)
+                )
         self._clear_pending_screenshot()
         if not self._chat_has_messages:
             self._chat_has_messages = True
             self._welcome.hide()
         bar = self._scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
+        # Реплика зафиксирована в памяти — синхронизируем JSON-файл сессии.
+        self._persist_chat()
+        # История изменилась — пересчитываем бар заполненности контекста.
+        self._refresh_context_bar()
         # Отправляем запрос в роутер (заглушка зрения / маршрут на стриминг).
         self._dispatch(text, pixmap)
 
     def _dispatch(self, text: str, pixmap: Optional[QPixmap]) -> None:
         """Выполняет решение роутера: мгновенный ответ или потоковая генерация.
 
-        Спрашивает main_router.route_request, который учитывает наличие скриншота
-        (Предохранитель Пока-ёкэ) и режим интерфейса. Возможны два исхода:
-          - "direct_reply": безопасный мгновенный ответ без обращения к Ollama;
-          - "stream": запуск фонового потока OllamaWorker со стримингом текста.
+        Спрашивает main_router.route_request с учётом режима интерфейса. Роутер
+        возвращает единый маршрут "stream"; скриншот (если прикреплён в Зоне 1)
+        передаётся прямо в LlamaWorker, где кодируется в Base64 и упаковывается
+        в мультимодальный Vision-контент (Этап 4 — заглушка зрения ликвидирована).
+        Возможны два исхода:
+          - "direct_reply": мгновенный ответ без обращения к сети (зарезервирован);
+          - "stream": запуск ЕДИНОГО фонового потока LlamaWorker со стримингом
+            текста одной монолитной модели Qwen3 через llama-server.
         """
-        has_screenshot = pixmap is not None and not pixmap.isNull()
-        decision = route_request(text, self._mode, has_screenshot)
+        decision = route_request(text, self._mode)
 
-        # Мгновенный ответ (например, заглушка зрения) — без фонового потока.
+        # Мгновенный ответ (зарезервированный сценарий) — без фонового потока.
         if decision.get("action") == "direct_reply":
             self._append_ai_message(
                 decision.get("reply", ""),
@@ -1385,45 +2457,28 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Сквозная оркестрация DeepSeek-R1 -> Mistral-Small ВО ВСЕХ режимах.
-        # Создаём двухфазный конвейер: размышления Дипсика стримятся в спойлер
-        # «Размышления...», а итог рассуждений уходит Помощнику архитектора,
-        # который формулирует финальный ответ на русском языке.
-        if decision.get("action") == "chain":
-            self._stream_raw = ""
-            row = self._begin_ai_stream()
-            worker = ChainedChatWorker(
-                prompt=decision.get("user_prompt", text),
-                orchestrator_model=decision.get(
-                    "orchestrator_model", "deepseek-r1:14b"),
-                orchestrator_prompt=decision.get("orchestrator_prompt"),
-                assistant_model=decision.get(
-                    "assistant_model", "mistral-small:22b"),
-                assistant_prompt=decision.get("assistant_prompt"),
-                mode=self._mode,
-                parent=self,
-            )
-            # Рассуждения Ведущего Архитектора обновляют спойлер мыслей.
-            worker.thinking_changed.connect(
-                lambda th, r=row: self._on_chain_thinking(r, th)
-            )
-            worker.chunk_received.connect(
-                lambda chunk, r=row: self._on_ai_chunk(r, chunk)
-            )
-            worker.generation_finished.connect(
-                lambda ans, th, r=row: self._on_ai_finished(r, ans, th)
-            )
-            worker.start()
-            return
-
-        # Маршрут на потоковую генерацию: создаём строку ответа и фон. поток.
+        # Единый одномодельный маршрут ВО ВСЕХ режимах (Чат / Помощник /
+        # Песочница): запрос уходит на монолитную Qwen3 через llama-server.
+        # Рассуждения модели внутри <thinking> (английский) стримятся в спойлер
+        # «Размышления...», а видимый ответ (русский) плавно рисуется в MessageRow.
+        self._stream_raw = ""
         row = self._begin_ai_stream()
-        worker = OllamaWorker(
+        worker = LlamaWorker(
             prompt=decision.get("user_prompt", text),
-            model=decision.get("model", "deepseek-r1:14b"),
+            model=decision.get("model", "Qwen3.8-27B-IQ3-MIX"),
             mode=self._mode,
             system_prompt=decision.get("system_prompt"),
+            # Второй эшелон памяти: стерильная история прошлых реплик (уже без
+            # <thinking>) пристыковывается к системному промпту в _build_messages.
+            chat_history=self._chat_history,
+            # Скриншот из Зоны 1: LlamaWorker закодирует его в Base64 и соберёт
+            # мультимодальный контент финального user-сообщения (Этап 4).
+            screenshot_pixmap=pixmap,
             parent=self,
+        )
+        # Рассуждения модели обновляют спойлер мыслей в реальном времени.
+        worker.thinking_changed.connect(
+            lambda th, r=row: self._on_chain_thinking(r, th)
         )
         # Привязываем каждый сигнал к СВОЕЙ строке через замыкание, чтобы при
         # параллельной генерации куски не попадали в чужое сообщение.
@@ -1451,14 +2506,43 @@ class MainWindow(QMainWindow):
         раскладку, а сама прокрутка откладывается в следующий цикл обработки
         событий (QTimer.singleShot), чтобы раскладка успела завершиться ДО скролла —
         иначе прокрутка опережает рост контента, и низ сообщения остаётся скрытым.
+
+        Прокрутка вниз выполняется ТОЛЬКО когда пользователь «прилип» к нижнему
+        краю (_pinned_to_bottom). Если он поднялся вверх читать историю — пересчёт
+        геометрии продолжается (контент не клипается), но ползунок больше не
+        сбрасывается вниз, и чтение не прерывается стримом.
         """
         widget = self._scroll.widget()
         if widget is not None:
             widget.updateGeometry()
         if hasattr(self, "_chat_layout"):
             self._chat_layout.activate()
+        if not self._pinned_to_bottom:
+            return
         bar = self._scroll.verticalScrollBar()
-        QTimer.singleShot(0, lambda b=bar: b.setValue(b.maximum()))
+
+        def _do_follow() -> None:
+            # Повторная проверка флага в момент срабатывания таймера защищает от
+            # гонки: если пользователь успел прокрутить вверх за один цикл событий
+            # между планированием и выполнением — рывка вниз не произойдёт.
+            if self._pinned_to_bottom:
+                bar.setValue(bar.maximum())
+
+        QTimer.singleShot(0, _do_follow)
+
+    def _on_chat_scrolled(self, value: int) -> None:
+        """Отслеживает намерение пользователя при ручной прокрутке чата.
+
+        Сигнал valueChanged срабатывает при любом движении ползунка — как от колеса
+        мыши, жестов и клавиатуры, так и от программного setValue. Если текущая
+        позиция ушла от нижнего края дальше порога CHAT_SCROLL_PIN_THRESHOLD_PX,
+        автоследование за стримом отключается; вернувшись к низу, пользователь
+        снова «прилипает» и лента продолжает следовать за генерацией.
+        """
+        bar = self._scroll.verticalScrollBar()
+        self._pinned_to_bottom = (
+            value >= bar.maximum() - CHAT_SCROLL_PIN_THRESHOLD_PX
+        )
 
     def _on_ai_chunk(self, row: MessageRow, chunk: str) -> None:
         """Обновляет строку ответа на каждый новый фрагмент стрима.
@@ -1472,28 +2556,90 @@ class MainWindow(QMainWindow):
         self._scroll_to_bottom()
 
     def _on_ai_finished(self, row: MessageRow, answer: str, thinking: str) -> None:
-        """Финализирует строку ответа по завершении генерации в фоне."""
+        """Финализирует строку ответа по завершении генерации в фоне.
+
+        Это ТОЧКА ТРИГГЕРА перехвата JSON (Этап 3, Шаг 3): стриминг от
+        llama-server полностью завершён (сигнал generation_finished), поэтому
+        финальный ответ модели прогоняется через исполнительный контур
+        execute_tool_commands. Если модель прислала markdown-блок ```json с
+        командами кубиков — парсер извлечёт его, преобразует в словарь Python
+        и ФИЗИЧЕСКИ выполнит команды в AutoCAD (например, draw_circle). Любая
+        ошибка парсинга (битый JSON из-за квантового сбоя) уходит в скрытый
+        системный лог и НЕ роняет интерфейс (принцип Пока-ёкэ).
+        """
         row.set_ai_stream(answer, thinking)
         row.finish_ai_stream()
+        # Второй контур памяти: финальный ответ стерилизуется — черновик мыслей
+        # <thinking> намертво вырезается, а JSON-пакеты команд и текстовые итоги
+        # сохраняются, чтобы модель помнила прошлые геометрические построения.
+        clean_answer = clean_response_for_history(answer)
+        if clean_answer:
+            self._chat_history.append({"role": "assistant", "content": clean_answer})
+        # Активация исполнительного контура: автономный вызов кубиков из реестра.
+        results = execute_tool_commands(answer)
+        # Предохранитель индикатора CAD мог заблокировать боевой пакет при
+        # закрытой САПР — показываем явную ошибку вместо ложного отчёта об успехе.
+        for item in results:
+            if item.get("tool_name") == CAD_FUSE_MARKER:
+                self._show_cad_fuse_error(item.get("result", ""))
         self._stream_raw = ""
         self._scroll_to_bottom()
+        # Ответ зафиксирован в истории — обновляем бар контекста (Зона 3).
+        self._refresh_context_bar()
+        # Ответ ассистента добавлен — сохраняем сессию в JSON-файл на диск.
+        self._persist_chat()
+
+    def _show_cad_fuse_error(self, result: str) -> None:
+        """Показывает служебную ошибку блокировки предохранителя CAD в чате.
+
+        Срабатывает, когда роутер вернул маркер CAD_FUSE_MARKER: боевой
+        JSON-пакет был отклонён, потому что индикатор сигнализирует об
+        отсутствии подключения к AutoCAD (закрытая САПР). Пользователь
+        видит понятную ошибку в правом нижнем углу, а не ложный успех.
+        """
+        try:
+            message = json.loads(result or "{}").get(
+                "message", "Выполнение заблокировано: AutoCAD не подключён."
+            )
+        except (ValueError, TypeError):
+            message = "Выполнение заблокировано: AutoCAD не подключён."
+        InfoBar.error(
+            title="AutoCAD не подключён",
+            content=message,
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.BOTTOM_RIGHT,
+            duration=8000,
+            parent=self,
+        )
 
     def _on_chain_thinking(self, row: MessageRow, thinking: str) -> None:
-        """Обновляет спойлер рассуждений Дипсика в конвейере.
+        """Обновляет спойлер рассуждений Qwen3 в одномодельном потоке.
 
         В отличие от _on_ai_chunk, этот обработчик НЕ трогает текст ответа: пока
-        Ведущий Архитектор рассуждает, видимый финальный ответ параллельно
-        стримит Помощник архитектора (Мистраль) через сигнал chunk_received.
+        модель рассуждает внутри <thinking> (английский язык), спойлер мыслей
+        обновляется целиком, а видимый русскоязычный ответ стримится отдельно
+        через сигнал chunk_received.
         """
         row.set_thinking_only(thinking)
         self._scroll_to_bottom()
 
     def _append_ai_message(self, text: str, thinking: str = "") -> None:
-        """Добавляет готовое (мгновенное) сообщение ИИ в ленту чата."""
+        """Добавляет готовое (мгновенное) сообщение ИИ в ленту чата.
+
+        Мгновенные ответы (зарезервированный сценарий direct_reply) тоже
+        фиксируются в стерильной памяти чата, чтобы модель помнила исход диалога.
+        """
         row = MessageRow(self._scroll)
         row.show_ai(text, thinking)
+        clean_text = clean_response_for_history(text)
+        if clean_text:
+            self._chat_history.append({"role": "assistant", "content": clean_text})
         self._chat_layout.insertWidget(self._chat_layout.count() - 1, row)
         self._scroll_to_bottom()
+        self._refresh_context_bar()
+        # Мгновенный ответ добавлен в память — сохраняем сессию на диск.
+        self._persist_chat()
 
     def _launch_snipper(self) -> None:
         # Оверлей создаётся без родителя, чтобы охватить весь экран и не
@@ -1505,24 +2651,98 @@ class MainWindow(QMainWindow):
     def _on_screenshot_captured(self, pixmap: QPixmap, bbox: tuple) -> None:
         # Сохраняем скриншот до момента отправки сообщения.
         self._pending_screenshot = pixmap
-        self._preview.set_pixmap(pixmap)
+        # Превью живёт в Зоне 1 капсулы: set_pixmap раскрывает само превью,
+        # а set_has_screenshot разворачивает всю Зону 1 (контекст сообщения).
+        self._capsule.preview.set_pixmap(pixmap)
+        self._capsule.set_has_screenshot(True)
         self._reposition_fade_overlay()
-        # Прикреплённый скриншот разрешает отправку даже без текста.
-        if hasattr(self, "_capsule"):
-            self._capsule.set_has_screenshot(True)
 
     def _clear_screenshot(self) -> None:
         """Закрывает превью и сбрасывает ожидающий скриншот."""
         self._clear_pending_screenshot()
 
     def _clear_pending_screenshot(self) -> None:
-        """Скрывает превью и очищает сохранённый скриншот."""
+        """Скрывает превью, схлопывает Зону 1 и очищает сохранённый скриншот."""
         self._pending_screenshot = None
-        if hasattr(self, "_preview"):
-            self._preview.hide()
-        # Скриншот удалён — отправка снова требует наличия текста.
         if hasattr(self, "_capsule"):
+            # Зона 1 схлопывается по высоте вместе со скрытием превью.
             self._capsule.set_has_screenshot(False)
+
+    def _on_cad_status(self, connected: bool, name: str, full_path: str) -> None:
+        """Обновляет светодиод и имя DWG-чертежа в Зоне 3 капсулы.
+
+        Вызывается сигналом CadStatusPoller из главного потока GUI.
+        Правило нарезки имени (ТЗ): максимум 30 символов — целиком; если имя
+        длиннее — строго первые 27 символов и троеточие «...».
+        """
+        # Синхронизируем аппаратный предохранитель роутера с индикатором:
+        # флаг False (красный светодиод «Нет подключения») намертво блокирует
+        # боевые JSON-команды кубиков ещё ДО их исполнения (анти-фантомное
+        # черчение, Пока-ёкэ фронтенда).
+        set_cad_connection_state(connected)
+        if not hasattr(self, "_capsule"):
+            return
+        if connected and name:
+            self._capsule.status_led.setText("🟢")
+            self._capsule.status_led.setToolTip("Подключение к AutoCAD активно")
+            display_name = name[:27] + "..." if len(name) > 30 else name
+            self._capsule.dwg_label.setText(display_name)
+            self._capsule.dwg_label.setToolTip(
+                "Путь: {}\nФайл: {}".format(full_path or "(не сохранён)", name)
+            )
+        else:
+            self._capsule.status_led.setText("🔴")
+            self._capsule.status_led.setToolTip("AutoCAD не подключён")
+            self._capsule.dwg_label.setText("Нет подключения")
+            self._capsule.dwg_label.setToolTip(
+                "Запустите AutoCAD и откройте чертёж."
+            )
+
+    def _refresh_context_bar(self) -> None:
+        """Пересчитывает кольцо заполненности контекста (Зона 3, правое крыло).
+
+        Максимум — фактическое контекстное окно llama-server (n_ctx) из кэша
+        core_core: сеть в главном потоке не опрашивается, чтобы не замораживать
+        GUI. Заполнение — грубая оценка токенов стерильной истории чата плюс
+        текущий вводимый текст. Тултип кольца — текстовая строка в тысячах
+        токенов с процентом (без ASCII-квадратиков).
+        """
+        if not hasattr(self, "_capsule"):
+            return
+        ring = self._capsule.context_ring
+        cached = get_cached_n_ctx()
+        max_tokens = int(cached) if cached else 4096
+        used = sum(
+            estimate_tokens(str(item.get("content", "")))
+            for item in self._chat_history
+        )
+        used += estimate_tokens(self._capsule.input.toPlainText())
+        used = max(0, min(used, max_tokens))
+        percent = int(round(used / max_tokens * 100)) if max_tokens else 0
+        # Кольцо и его кастомный тултип-полоска обновляются одним вызовом.
+        ring.update_progress(used, max_tokens, percent)
+
+    def _poll_context_cache(self) -> None:
+        """Проверяет, наполнился ли кэш n_ctx, и пересчитывает бар один раз."""
+        cached = get_cached_n_ctx()
+        if cached is not None and cached != self._last_context_max:
+            self._last_context_max = cached
+            self._refresh_context_bar()
+
+    def _on_server_limits_updated(self, n_ctx: int) -> None:
+        """Реактивно перестраивает максимум бара при изменении n_ctx сервера.
+
+        Слот heartbeat-поллера ServerLimitsPoller: новый максимум контекста
+        (например, реальные 16384 вместо стартовых 4096) применяется на лету
+        через ContextRing.update_progress — без перезапуска GUI (Пока-ёкэ
+        рассинхронизации индикатора с фактическим окном llama-server).
+        """
+        limit = int(n_ctx or 0)
+        if limit <= 0:
+            return
+        if limit != self._last_context_max:
+            self._last_context_max = limit
+            self._refresh_context_bar()
 
     def _reposition_fade_overlay(self) -> None:
         if not hasattr(self, "_fade_overlay") or not hasattr(self, "_capsule"): return
@@ -1556,6 +2776,19 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "_welcome"): self._welcome.setGeometry(self._scroll.geometry())
         self._reposition_fade_overlay()
+
+    def closeEvent(self, event) -> None:
+        # Корректно завершаем фоновые опросы: AutoCAD, heartbeat-лимиты
+        # llama-server и лёгкий таймер кэша контекста.
+        if hasattr(self, "_cad_poller"):
+            self._cad_poller.requestInterruption()
+            self._cad_poller.wait(2500)
+        if hasattr(self, "_limits_poller"):
+            self._limits_poller.requestInterruption()
+            self._limits_poller.wait(2500)
+        if hasattr(self, "_context_cache_timer"):
+            self._context_cache_timer.stop()
+        super().closeEvent(event)
 
     def set_mode(self, mode: str) -> None:
         self._mode = mode
